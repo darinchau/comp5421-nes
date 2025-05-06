@@ -8,13 +8,13 @@ import wandb
 from dataclasses import asdict
 from dataclasses import dataclass
 from datasets import load_dataset
-from diffusers import DDPMScheduler, UNet2DModel
+from diffusers import DDPMScheduler, UNet2DModel, DDIMScheduler
 from dotenv import load_dotenv
 from torchvision import datasets, transforms
 from torchvision.utils import make_grid
 from torch.utils.data import DataLoader
 from tqdm import tqdm, trange
-from utils import sanity_check
+from utils import batch_convert
 
 load_dotenv()
 huggingface_hub.login(os.getenv("HF_TOKEN"))
@@ -25,11 +25,13 @@ class COMP5421Config():
     batch_size: int
     num_epochs: int
     learning_rate: float
+    num_train_timesteps: int
     dataset_src: str
     training_name: str
     val_size: float
     val_step: int                   # Validate every n steps
     val_samples: float              # Validate over n samples instead of the whole val set
+    log_audio_count: int          # Number of audio samples to log
     save_step: int
     save_dir: str
     grad_accumulation_iters: int    # Accumulate gradients over n iterations
@@ -42,12 +44,14 @@ class COMP5421Config():
         parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training")
         parser.add_argument("--num_epochs", type=int, default=10, help="Number of epochs to train")
         parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate for the optimizer")
+        parser.add_argument("--num_train_timesteps", type=int, default=1000, help="Number of training timesteps for the scheduler")
         parser.add_argument("--dataset_src", type=str, default="./exprsco2img.npz", help="Dataset source")
         parser.add_argument("--training_name", type=str, default="comp5421-nes", help="Name of the training run")
         parser.add_argument("--val_size", type=float, default=0.1, help="Validation set size as a fraction of the dataset")
-        parser.add_argument("--val_step", type=int, default=1024, help="Validation step frequency")
+        parser.add_argument("--val_step", type=int, default=128, help="Validation step frequency")
         parser.add_argument("--val_samples", type=float, default=0.1, help="Number of samples to validate over")
-        parser.add_argument("--save_step", type=int, default=1024, help="Model save step frequency")
+        parser.add_argument("--log_audio_count", type=int, default=4, help="Number of audio samples to log")
+        parser.add_argument("--save_step", type=int, default=4096, help="Model save step frequency")
         parser.add_argument("--save_dir", type=str, default="./checkpoints", help="Directory to save checkpoints")
         parser.add_argument("--grad_accumulation_iters", type=int, default=2, help="Gradient accumulation steps")
         parser.add_argument("--load_model_from", type=str, default=None, help="Checkpoint to load model from")
@@ -88,7 +92,58 @@ class COMP5421Dataset(torch.utils.data.Dataset):
         return len(self.indices)
 
     def __getitem__(self, idx):
-        return self.datafiles[idx], self.frames[idx]
+        return self.datafiles[idx]
+
+
+def sanity_check(batch: torch.Tensor):
+    """Check the constraints of the dataset."""
+    batch_size = batch.shape[0]
+    assert batch.shape == (batch_size, 4, 128, 256), f"Batch shape should be (batch_size, 4, 128, 256) but got {batch.shape}"
+    assert batch.count_nonzero(dim=2).max() == 1., f"Each instrument should only have at most one note per time frame, found {batch.count_nonzero(dim=2).max()}"
+    assert torch.isclose((batch * 15).to(torch.int32).float(), batch * 15, atol=1e-5).all(), f"Instrument velocity should be 4-bit quantized"
+    d = batch.sum(0)
+    note_min = [32, 32, 21, 1]
+    note_max = [108, 108, 108, 16]
+    for i in range(4):
+        for j in range(128):
+            if not (note_min[i] <= j <= note_max[i]):
+                assert d[i, j].sum() == 0, f"Note {j} should not be present in the dataset for instrument {i}"
+
+
+def enforce_constraints(batch: torch.Tensor):
+    """Enforce the constraints of the dataset on the batch."""
+    batch_size = batch.shape[0]
+    assert batch.shape == (batch_size, 4, 128, 256), f"Batch shape should be (batch_size, 4, 128, 256) but got {batch.shape}"
+
+    # Deep copy the batch and remove the gradients
+    x = batch.detach()
+
+    # Silence all the notes that are not supposed to sound
+    note_min = [32, 32, 21, 1]
+    note_max = [108, 108, 108, 16]
+    for i in range(4):
+        for j in range(128):
+            if not (note_min[i] <= j <= note_max[i]):
+                x[:, i, j] = 0
+
+    # Take only the note with the highest velocity for each time frame
+    max_indices = torch.argmax(x, dim=2)
+    y = torch.zeros_like(x)
+    y.scatter_(2, max_indices.unsqueeze(2), x.gather(2, max_indices.unsqueeze(2)))
+    x = y
+    del y
+
+    # Snap all the notes to the nearest 4-bit quantization level
+    x = torch.clamp(x, 0, 1)
+    x = torch.round(x * 15) / 15
+
+    # Add the gradients of the original batch to the new batch
+    # nasty little trick I learned from pytorch codebase
+    x = batch + (x - batch).detach()
+
+    x.requires_grad = batch.requires_grad
+    sanity_check(x)
+    return x
 
 
 def set_seed(seed: int):
@@ -109,7 +164,7 @@ def validate(
 ) -> torch.Tensor:
     val_loss = 0.0
     val_count = 0
-    for val_batch, frames in tqdm(loader, desc="Validating...", total=config.val_step):
+    for val_batch in tqdm(loader, desc="Validating...", total=config.val_step):
         val_count += 1
         val_batch = val_batch.to(device)
         noise = torch.randn_like(val_batch)
@@ -125,6 +180,49 @@ def validate(
 
 def save_model(config: COMP5421Config, model: UNet2DModel, step_count: int):
     model.save_pretrained(os.path.join(config.save_dir, f"{config.training_name}-{config.dataset_src.split('/')[1]}-step-{step_count}"))
+
+
+def log_audio(model: UNet2DModel, config: COMP5421Config, device: torch.device, step_count: int):
+    sampling_bs = config.log_audio_count
+    steps = 100
+    generator = torch.Generator(device=device)
+
+    sampler = DDIMScheduler(
+        num_train_timesteps=config.num_train_timesteps
+    )
+
+    latents = torch.randn((sampling_bs, 4, 128, 256), device=device, generator=generator, dtype=torch.float32)
+    latents = latents * sampler.init_noise_sigma
+    sampler.set_timesteps(steps)
+    timesteps = sampler.timesteps.to(device)
+
+    extra_step_kwargs = {
+        'eta': 0.0,
+        'generator': generator
+    }
+
+    with torch.no_grad():
+        for i, t in enumerate(tqdm(timesteps, desc="Sampling...")):
+            model_input = latents
+
+            timestep_tensor = torch.tensor([t], dtype=torch.long, device=device)
+            timestep_tensor = timestep_tensor.expand(latents.shape[0])
+            noise_pred = model(model_input, timestep_tensor)[0]
+
+            latents = sampler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
+
+    latents = enforce_constraints(latents)
+    audios = batch_convert(latents, tickrate=24, sr=44100)
+    audios = audios / np.max(np.abs(audios), axis=1, keepdims=True)
+    latent_images = latents[:, :3] + latents[:, 3:4]  # broadcast the drum channel to the other channels to make it white
+    log = {
+        f"audio_{i}": wandb.Audio(audios[i], sample_rate=44100, caption=f"Generated audio {i}")
+        for i in range(config.log_audio_count)
+    } | {
+        f"image_{i}": wandb.Image(latent_images[i].permute(1, 2, 0).cpu().numpy(), caption=f"Generated image {i}")
+        for i in range(config.log_audio_count)
+    }
+    wandb.log(log, step=step_count)
 
 
 def main():
@@ -159,22 +257,15 @@ def main():
     model = model.to(device)
     model.train()
 
-    def collate_fn(batch):
-        b = [item[0] for item in batch]
-        b = torch.stack(b, dim=0)
-        frames = [item[1] for item in batch]
-        frames = torch.tensor(frames, dtype=torch.int64)
-        return b, frames
-
     # Load dataset
     dataset = COMP5421Dataset(config)
     train_size = int((1 - config.val_size) * len(dataset))
     test_size = len(dataset) - train_size
     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, test_size])
-    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, drop_last=True, collate_fn=collate_fn)
-    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, drop_last=False, collate_fn=collate_fn)
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, drop_last=True)
+    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, drop_last=False)
 
-    noise_scheduler = DDPMScheduler(num_train_timesteps=1000)
+    noise_scheduler = DDPMScheduler(num_train_timesteps=config.num_train_timesteps)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
     loss_func = torch.nn.MSELoss()
 
@@ -186,11 +277,13 @@ def main():
         config=asdict(config)
     )
 
+    log_audio(model, config, device, step_count)
+
     # Training Loop
     for epoch in range(config.num_epochs):
         model.train()
         epoch_loss = 0.0
-        for batch, frames in tqdm(train_loader, desc=f'Epoch {epoch + 1}/{config.num_epochs}'):
+        for batch in tqdm(train_loader, desc=f'Epoch {epoch + 1}/{config.num_epochs}'):
             step_count += 1
             optimizer.zero_grad()
 
@@ -231,6 +324,7 @@ def main():
         average_epoch_loss = epoch_loss / len(train_loader)
         print(f'Epoch {epoch + 1} completed, Average Loss: {average_epoch_loss}')
         save_model(config, model, step_count)
+        log_audio(model, config, device, step_count)
         wandb.log({"epoch_loss": average_epoch_loss}, step=step_count)
 
     save_model(config, model, step_count)
