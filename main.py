@@ -14,6 +14,7 @@ from torchvision import datasets, transforms
 from torchvision.utils import make_grid
 from torch.utils.data import DataLoader
 from tqdm import tqdm, trange
+from utils import sanity_check
 
 load_dotenv()
 huggingface_hub.login(os.getenv("HF_TOKEN"))
@@ -65,37 +66,37 @@ class COMP5421Dataset(torch.utils.data.Dataset):
 
         datafiles = []
         indices = []
+        frames = []
 
         for test_index in trange(len(data.files), desc="Loading dataset from npz..."):
             index = data.files[test_index]
             test_img = data[index]
+            nsamples = int(index.split(".pkl_")[1])
             datafiles.append(test_img)
             indices.append(index)
+            frames.append(nsamples)
 
         datafiles = np.array(datafiles)
         self.datafiles = torch.tensor(datafiles, dtype=torch.float32)
         self.indices = indices
+        self.datafiles = self.datafiles.permute(0, 3, 1, 2).contiguous()  # NCFT
+        self.frames = frames
 
         sanity_check(self.datafiles)
-
-        self.datafiles = self.datafiles.permute(0, 3, 1, 2).contiguous()  # NCFT
 
     def __len__(self):
         return len(self.indices)
 
     def __getitem__(self, idx):
-        return self.datafiles[idx]  # (smth like 128, 256, 4)
+        return self.datafiles[idx], self.frames[idx]
 
 
-def sanity_check(datafiles: torch.Tensor):
-    # Checks some assumptions about the dataset which we will use to skip some steps in training in the future
-    assert datafiles.sum(dim=1).max() == 1., "Each instrument should only have at most one note per time frame"
-    assert torch.all(torch.unique(datafiles, sorted=True) * 15 == torch.arange(16)), f"Instrument velocity should be 4-bit quantized"
-    d = datafiles.sum(0)
-    for i in list(range(21)) + list(range(109, 128)):
-        assert d[i, :, :3].sum() == 0, f"Note {i} should not be present in the dataset"
-    for i in [0] + list(range(21, 128)):
-        assert d[i, :, 3].sum() == 0, f"Note {i} should not be present in the dataset"
+def set_seed(seed: int):
+    """Set the random seed for reproducibility."""
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def validate(
@@ -108,7 +109,7 @@ def validate(
 ) -> torch.Tensor:
     val_loss = 0.0
     val_count = 0
-    for val_batch in tqdm(loader, desc="Validating...", total=config.val_step):
+    for val_batch, frames in tqdm(loader, desc="Validating...", total=config.val_step):
         val_count += 1
         val_batch = val_batch.to(device)
         noise = torch.randn_like(val_batch)
@@ -158,13 +159,20 @@ def main():
     model = model.to(device)
     model.train()
 
+    def collate_fn(batch):
+        b = [item[0] for item in batch]
+        b = torch.stack(b, dim=0)
+        frames = [item[1] for item in batch]
+        frames = torch.tensor(frames, dtype=torch.int64)
+        return b, frames
+
     # Load dataset
     dataset = COMP5421Dataset(config)
     train_size = int((1 - config.val_size) * len(dataset))
     test_size = len(dataset) - train_size
     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, test_size])
-    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, drop_last=False)
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, drop_last=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, drop_last=False, collate_fn=collate_fn)
 
     noise_scheduler = DDPMScheduler(num_train_timesteps=1000)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
@@ -182,7 +190,7 @@ def main():
     for epoch in range(config.num_epochs):
         model.train()
         epoch_loss = 0.0
-        for batch in tqdm(train_loader, desc=f'Epoch {epoch + 1}/{config.num_epochs}'):
+        for batch, frames in tqdm(train_loader, desc=f'Epoch {epoch + 1}/{config.num_epochs}'):
             step_count += 1
             optimizer.zero_grad()
 

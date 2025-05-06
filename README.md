@@ -1,0 +1,1 @@
+`pip install -v git+https://github.com/addinh/nesmdb.git@python-3-support`

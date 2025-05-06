@@ -1,0 +1,3 @@
+[submodule "nesmdb"]
+	path = nesmdb
+	url = https://github.com/addinh/nesmdb
