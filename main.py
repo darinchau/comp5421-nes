@@ -32,6 +32,7 @@ class COMP5421Config():
     training_name: str
     grad_accumulation_iters: int        # Accumulate gradients over n iterations
     flatten_music: bool                 # Flatten the music dataset to a single channel by layering all notes on top of each other
+    prune_gradients: bool               # Prune the gradients at the places where the notes are not supposed to sound
     load_model_from: str | None
 
     # Validation
@@ -60,6 +61,7 @@ class COMP5421Config():
         parser.add_argument("--training_name", type=str, default="comp5421-nes", help="Name of the training run")
         parser.add_argument("--grad_accumulation_iters", type=int, default=2, help="Gradient accumulation steps")
         parser.add_argument("--flatten_music", action="store_true", help="Flatten the music dataset to a single channel by layering all notes on top of each other")
+        parser.add_argument("--no-prune_gradients", action="store_false", dest="prune_gradients", help="Prune the gradients at the places where the notes are not supposed to sound")
         parser.add_argument("--load_model_from", type=str, default=None, help="Checkpoint to load model from")
 
         parser.add_argument("--val_size", type=float, default=0.1, help="Validation set size as a fraction of the dataset")
@@ -131,6 +133,19 @@ def sanity_check(batch: torch.Tensor):
                 assert d[i, j].sum() == 0, f"Note {j} should not be present in the dataset for instrument {i}"
 
 
+def silence_notes_(batch: torch.Tensor):
+    assert len(batch.shape) == 4, f"Batch shape should be (batch_size, 4, 128, 256) or (batch_size, 1, X, 256), but got {batch.shape}"
+    assert batch.shape[1] in [1, 4], f"Batch shape should be (batch_size, 4, 128, 256) or (batch_size, 1, X, 256), but got {batch.shape}"
+    if batch.shape[1] == 4:
+        note_min, note_max = get_note_ranges()
+        for i in range(4):
+            for j in range(128):
+                if not (note_min[i] <= j <= note_max[i]):
+                    batch[:, i, j] = 0
+    else:
+        batch[:, :, 258:] = 0  # silence the padding notes
+
+
 def enforce_constraints(batch: torch.Tensor, keep_max_note_only: bool = True, quantize: bool = True, check: bool = True) -> torch.Tensor:
     """Enforce the constraints of the dataset on the batch."""
     batch_size = batch.shape[0]
@@ -140,11 +155,7 @@ def enforce_constraints(batch: torch.Tensor, keep_max_note_only: bool = True, qu
     x = batch.detach()
 
     # Silence all the notes that are not supposed to sound
-    note_min, note_max = get_note_ranges()
-    for i in range(4):
-        for j in range(128):
-            if not (note_min[i] <= j <= note_max[i]):
-                x[:, i, j] = 0
+    silence_notes_(x)
 
     # Take only the note with the highest velocity for each time frame
     if keep_max_note_only:
@@ -178,6 +189,20 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
+def infer(config: COMP5421Config, batch: torch.Tensor, model: UNet2DModel, noise_scheduler: DDPMScheduler, loss_func: torch.nn.Module, device: torch.device):
+    batch = batch.to(device)
+    noise = torch.randn_like(batch)
+    if config.prune_gradients:
+        silence_notes_(noise)
+    timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (batch.size(0),), device=device, dtype=torch.int64)
+    noisy_batch = noise_scheduler.add_noise(batch, noise, timesteps)
+    noise_pred = model(noisy_batch, timesteps)[0]
+    if config.prune_gradients:
+        silence_notes_(noise_pred)
+    loss = loss_func(noise_pred, noise)
+    return loss
+
+
 def validate(
     config: COMP5421Config,
     model: UNet2DModel,
@@ -190,12 +215,7 @@ def validate(
     val_count = 0
     for val_batch in tqdm(loader, desc="Validating...", total=config.val_step):
         val_count += 1
-        val_batch = val_batch.to(device)
-        noise = torch.randn_like(val_batch)
-        timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (val_batch.size(0),), device=device, dtype=torch.int64)
-        noisy_batch = noise_scheduler.add_noise(val_batch, noise, timesteps)
-        noise_pred = model(noisy_batch, timesteps)[0]
-        loss = loss_func(noise_pred, noise)
+        loss = infer(config, val_batch, model, noise_scheduler, loss_func, device)
         val_loss += loss
         if val_count >= config.val_step:
             break
@@ -323,18 +343,7 @@ def main():
             # Batch shape: (batch_size, 4, 128, 256) if flatten_music is False, else (batch_size, 1, X=260, 256)
             step_count += 1
             optimizer.zero_grad()
-
-            # Add noise
-            batch = batch.to(device)
-            noise = torch.randn_like(batch)
-            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (batch.size(0),), device=device, dtype=torch.int64)
-            noisy_batch = noise_scheduler.add_noise(batch, noise, timesteps)
-
-            # Forward pass
-            noise_pred = model(noisy_batch, timesteps)[0]
-
-            # Loss
-            loss = loss_func(noise_pred, noise)
+            loss = infer(config, batch, model, noise_scheduler, loss_func, device)
             loss.backward()
 
             if ((step_count + 1) % config.grad_accumulation_iters == 0):
