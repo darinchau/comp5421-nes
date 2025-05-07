@@ -14,7 +14,7 @@ from torchvision import datasets, transforms
 from torchvision.utils import make_grid
 from torch.utils.data import DataLoader
 from tqdm import tqdm, trange
-from utils import batch_convert
+from utils import batch_convert, flatten_batch, unflatten_batch
 
 load_dotenv()
 huggingface_hub.login(os.getenv("HF_TOKEN"))
@@ -30,6 +30,7 @@ class COMP5421Config():
     dataset_src: str
     training_name: str
     grad_accumulation_iters: int        # Accumulate gradients over n iterations
+    flatten_music: bool                 # Flatten the music dataset to a single channel by layering all notes on top of each other
     load_model_from: str | None
 
     # Validation
@@ -57,6 +58,7 @@ class COMP5421Config():
         parser.add_argument("--dataset_src", type=str, default="./exprsco2img.npz", help="Dataset source")
         parser.add_argument("--training_name", type=str, default="comp5421-nes", help="Name of the training run")
         parser.add_argument("--grad_accumulation_iters", type=int, default=2, help="Gradient accumulation steps")
+        parser.add_argument("--flatten_music", action="store_true", help="Flatten the music dataset to a single channel by layering all notes on top of each other")
         parser.add_argument("--load_model_from", type=str, default=None, help="Checkpoint to load model from")
 
         parser.add_argument("--val_size", type=float, default=0.1, help="Validation set size as a fraction of the dataset")
@@ -103,6 +105,9 @@ class COMP5421Dataset(torch.utils.data.Dataset):
         self.frames = frames
 
         sanity_check(self.datafiles)
+
+        if config.flatten_music:
+            self.datafiles = flatten_batch(self.datafiles).unsqueeze(1).contiguous()
 
     def __len__(self):
         return len(self.indices)
@@ -211,7 +216,10 @@ def log_audio(model: UNet2DModel, config: COMP5421Config, device: torch.device, 
         num_train_timesteps=config.num_train_timesteps
     )
 
-    latents = torch.randn((sampling_bs, 4, 128, 256), device=device, generator=generator, dtype=torch.float32)
+    if config.flatten_music:
+        latents = torch.randn((sampling_bs, 1, 258, 256), device=device, generator=generator, dtype=torch.float32)
+    else:
+        latents = torch.randn((sampling_bs, 4, 128, 256), device=device, generator=generator, dtype=torch.float32)
     latents = latents * sampler.init_noise_sigma
     sampler.set_timesteps(steps)
     timesteps = sampler.timesteps.to(device)
@@ -230,6 +238,9 @@ def log_audio(model: UNet2DModel, config: COMP5421Config, device: torch.device, 
             noise_pred = model(model_input, timestep_tensor)[0]
 
             latents = sampler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
+
+    if config.flatten_music:
+        latents = unflatten_batch(latents)
 
     latents = enforce_constraints(latents, keep_max_note_only=config.trim_audio_on_log, quantize=config.quantize_audio_on_log, check=True)
     audios = batch_convert(latents, tickrate=24, sr=44100)
@@ -257,9 +268,9 @@ def main():
         os.makedirs(config.save_dir)
 
     model = UNet2DModel(
-        sample_size=(128, 256),
-        in_channels=4,
-        out_channels=4,
+        sample_size=(258, 256) if config.flatten_music else (128, 256),
+        in_channels=1 if config.flatten_music else 4,
+        out_channels=1 if config.flatten_music else 4,
         layers_per_block=2,
         block_out_channels=(32, 64, 64),
         down_block_types=("DownBlock2D", "AttnDownBlock2D", "DownBlock2D"),
@@ -304,6 +315,7 @@ def main():
         model.train()
         epoch_loss = 0.0
         for batch in tqdm(train_loader, desc=f'Epoch {epoch + 1}/{config.num_epochs}'):
+            # Batch shape: (batch_size, 4, 128, 256) if flatten_music is False, else (batch_size, 1, X=258, 256)
             step_count += 1
             optimizer.zero_grad()
 

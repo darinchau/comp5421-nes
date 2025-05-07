@@ -100,3 +100,30 @@ def batch_convert(batch: torch.Tensor, tickrate: int = 24, sr: int = 44100) -> n
         output = img_to_wave(img, tickrate, sr)
         outputs.append(output)
     return np.array(outputs, dtype=np.float32)
+
+
+def flatten_batch(batch: torch.Tensor) -> torch.Tensor:
+    """Flatten the batch of images."""
+    batch_size = batch.shape[0]
+    assert batch.shape == (batch_size, 4, 128, 256), f"Batch shape should be (batch_size, 4, 128, 256) but got {batch.shape}"
+    note_min = [32, 32, 21, 1]
+    note_max = [108, 108, 108, 16]
+    fillable_ranges = [batch[:, i, lower:upper + 1] for i, (lower, upper) in enumerate(zip(note_min, note_max))]
+    print([f.shape for f in fillable_ranges])
+    flattened = torch.concatenate(fillable_ranges, dim=1)
+    print(flattened.shape)
+    return flattened
+
+
+def unflatten_batch(batch: torch.Tensor) -> torch.Tensor:
+    batch_size = batch.shape[0]
+    assert batch.shape[2] == 256, f"Batch shape should be (batch_size, X, 256) but got {batch.shape}"
+    note_min = [32, 32, 21, 1]
+    note_max = [108, 108, 108, 16]
+    unflattened = torch.zeros((batch_size, 4, 128, 256), dtype=batch.dtype, device=batch.device)
+    start = 0
+    for i, (lower, upper) in enumerate(zip(note_min, note_max)):
+        range_size = upper - lower + 1
+        unflattened[:, i, lower:upper + 1] = batch[:, start:start + range_size]
+        start += range_size
+    return unflattened
