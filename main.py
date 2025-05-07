@@ -22,21 +22,30 @@ huggingface_hub.login(os.getenv("HF_TOKEN"))
 
 @dataclass(frozen=True)
 class COMP5421Config():
+    # Training
     batch_size: int
     num_epochs: int
     learning_rate: float
     num_train_timesteps: int
     dataset_src: str
     training_name: str
+    grad_accumulation_iters: int        # Accumulate gradients over n iterations
+    load_model_from: str | None
+
+    # Validation
     val_size: float
-    val_step: int                   # Validate every n steps
-    val_samples: float              # Validate over n samples instead of the whole val set
-    log_audio_count: int          # Number of audio samples to log
+    val_step: int                       # Validate every n steps
+    val_samples: float                  # Validate over n samples instead of the whole val set
+
+    # Logging
+    log_audio_count: int                # Number of audio samples to log
     save_step: int
     save_dir: str
-    grad_accumulation_iters: int    # Accumulate gradients over n iterations
-    load_model_from: str | None
-    seed: int                       # Random seed for reproducibility
+    quantize_audio_on_log: bool         # Whether to quantize the audio to 4-bit during wandb logging or not
+    trim_audio_on_log: bool             # Whether to keep only the maximum velocity note or not
+
+    # Miscellaneous
+    seed: int = 5421                    # Random seed for reproducibility
 
     @classmethod
     def parse(cls):
@@ -47,14 +56,21 @@ class COMP5421Config():
         parser.add_argument("--num_train_timesteps", type=int, default=1000, help="Number of training timesteps for the scheduler")
         parser.add_argument("--dataset_src", type=str, default="./exprsco2img.npz", help="Dataset source")
         parser.add_argument("--training_name", type=str, default="comp5421-nes", help="Name of the training run")
+        parser.add_argument("--grad_accumulation_iters", type=int, default=2, help="Gradient accumulation steps")
+        parser.add_argument("--load_model_from", type=str, default=None, help="Checkpoint to load model from")
+
         parser.add_argument("--val_size", type=float, default=0.1, help="Validation set size as a fraction of the dataset")
         parser.add_argument("--val_step", type=int, default=128, help="Validation step frequency")
         parser.add_argument("--val_samples", type=float, default=0.1, help="Number of samples to validate over")
+
         parser.add_argument("--log_audio_count", type=int, default=4, help="Number of audio samples to log")
         parser.add_argument("--save_step", type=int, default=4096, help="Model save step frequency")
         parser.add_argument("--save_dir", type=str, default="./checkpoints", help="Directory to save checkpoints")
-        parser.add_argument("--grad_accumulation_iters", type=int, default=2, help="Gradient accumulation steps")
-        parser.add_argument("--load_model_from", type=str, default=None, help="Checkpoint to load model from")
+        parser.add_argument("--quantize_audio_on_log", action="store_true", help="Whether to quantize the audio to 4-bit during wandb logging or not")
+        parser.add_argument("--no-quantize_audio_on_log", action="store_false", dest="quantize_audio_on_log", help="Whether to quantize the audio to 4-bit during wandb logging or not")
+        parser.add_argument("--trim_audio_on_log", action="store_true", help="Whether to keep only the maximum velocity note or not")
+        parser.add_argument("--no-trim_audio_on_log", action="store_false", dest="trim_audio_on_log", help="Whether to keep only the maximum velocity note or not")
+
         parser.add_argument("--seed", type=int, default=5421, help="Random seed for reproducibility")
 
         args = parser.parse_args()
@@ -110,7 +126,7 @@ def sanity_check(batch: torch.Tensor):
                 assert d[i, j].sum() == 0, f"Note {j} should not be present in the dataset for instrument {i}"
 
 
-def enforce_constraints(batch: torch.Tensor):
+def enforce_constraints(batch: torch.Tensor, keep_max_note_only: bool = True, quantize: bool = True, check: bool = True) -> torch.Tensor:
     """Enforce the constraints of the dataset on the batch."""
     batch_size = batch.shape[0]
     assert batch.shape == (batch_size, 4, 128, 256), f"Batch shape should be (batch_size, 4, 128, 256) but got {batch.shape}"
@@ -127,22 +143,26 @@ def enforce_constraints(batch: torch.Tensor):
                 x[:, i, j] = 0
 
     # Take only the note with the highest velocity for each time frame
-    max_indices = torch.argmax(x, dim=2)
-    y = torch.zeros_like(x)
-    y.scatter_(2, max_indices.unsqueeze(2), x.gather(2, max_indices.unsqueeze(2)))
-    x = y
-    del y
+    if keep_max_note_only:
+        max_indices = torch.argmax(x, dim=2)
+        y = torch.zeros_like(x)
+        y.scatter_(2, max_indices.unsqueeze(2), x.gather(2, max_indices.unsqueeze(2)))
+        x = y
+        del y
 
     # Snap all the notes to the nearest 4-bit quantization level
     x = torch.clamp(x, 0, 1)
-    x = torch.round(x * 15) / 15
+    if quantize:
+        x = torch.round(x * 15) / 15
 
     # Add the gradients of the original batch to the new batch
     # nasty little trick I learned from pytorch codebase
     x = batch + (x - batch).detach()
-
     x.requires_grad = batch.requires_grad
-    sanity_check(x)
+
+    should_check = keep_max_note_only and quantize and check
+    if should_check:
+        sanity_check(x)
     return x
 
 
@@ -211,7 +231,7 @@ def log_audio(model: UNet2DModel, config: COMP5421Config, device: torch.device, 
 
             latents = sampler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
 
-    latents = enforce_constraints(latents)
+    latents = enforce_constraints(latents, keep_max_note_only=config.trim_audio_on_log, quantize=config.quantize_audio_on_log, check=True)
     audios = batch_convert(latents, tickrate=24, sr=44100)
     audios = audios / np.max(np.abs(audios), axis=1, keepdims=True)
     latent_images = latents[:, :3] + latents[:, 3:4]  # broadcast the drum channel to the other channels to make it white
