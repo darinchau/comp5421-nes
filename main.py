@@ -10,11 +10,12 @@ from dataclasses import dataclass
 from datasets import load_dataset
 from diffusers import DDPMScheduler, UNet2DModel, DDIMScheduler
 from dotenv import load_dotenv
+from math import ceil
 from torchvision import datasets, transforms
 from torchvision.utils import make_grid
 from torch.utils.data import DataLoader
 from tqdm import tqdm, trange
-from utils import batch_convert, flatten_batch, unflatten_batch
+from utils import batch_convert, flatten_batch, unflatten_batch, get_note_ranges
 
 load_dotenv()
 huggingface_hub.login(os.getenv("HF_TOKEN"))
@@ -107,7 +108,7 @@ class COMP5421Dataset(torch.utils.data.Dataset):
         sanity_check(self.datafiles)
 
         if config.flatten_music:
-            self.datafiles = flatten_batch(self.datafiles).unsqueeze(1).contiguous()
+            self.datafiles = flatten_batch(self.datafiles, target_x=260).unsqueeze(1).contiguous()
 
     def __len__(self):
         return len(self.indices)
@@ -123,8 +124,7 @@ def sanity_check(batch: torch.Tensor):
     assert batch.count_nonzero(dim=2).max() == 1., f"Each instrument should only have at most one note per time frame, found {batch.count_nonzero(dim=2).max()}"
     assert torch.isclose((batch * 15).to(torch.int32).float(), batch * 15, atol=1e-5).all(), f"Instrument velocity should be 4-bit quantized"
     d = batch.sum(0)
-    note_min = [32, 32, 21, 1]
-    note_max = [108, 108, 108, 16]
+    note_min, note_max = get_note_ranges()
     for i in range(4):
         for j in range(128):
             if not (note_min[i] <= j <= note_max[i]):
@@ -140,8 +140,7 @@ def enforce_constraints(batch: torch.Tensor, keep_max_note_only: bool = True, qu
     x = batch.detach()
 
     # Silence all the notes that are not supposed to sound
-    note_min = [32, 32, 21, 1]
-    note_max = [108, 108, 108, 16]
+    note_min, note_max = get_note_ranges()
     for i in range(4):
         for j in range(128):
             if not (note_min[i] <= j <= note_max[i]):
@@ -217,7 +216,7 @@ def log_audio(model: UNet2DModel, config: COMP5421Config, device: torch.device, 
     )
 
     if config.flatten_music:
-        latents = torch.randn((sampling_bs, 1, 258, 256), device=device, generator=generator, dtype=torch.float32)
+        latents = torch.randn((sampling_bs, 1, 260, 256), device=device, generator=generator, dtype=torch.float32)
     else:
         latents = torch.randn((sampling_bs, 4, 128, 256), device=device, generator=generator, dtype=torch.float32)
     latents = latents * sampler.init_noise_sigma
@@ -240,6 +239,8 @@ def log_audio(model: UNet2DModel, config: COMP5421Config, device: torch.device, 
             latents = sampler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
 
     if config.flatten_music:
+        # undo the padding
+        latents = latents[:, 0, :258, :]
         latents = unflatten_batch(latents)
 
     latents = enforce_constraints(latents, keep_max_note_only=config.trim_audio_on_log, quantize=config.quantize_audio_on_log, check=True)
@@ -268,7 +269,11 @@ def main():
         os.makedirs(config.save_dir)
 
     model = UNet2DModel(
-        sample_size=(258, 256) if config.flatten_music else (128, 256),
+        # TODO allow to change this programmatically
+        # 260 is calculated from 258 notes + 2 for the padding to make it a multiple of 2 ** (len(block_out_channels) - 1)
+        # I am too tired to not hard code this right now
+        # Just be weary of all the 258s and 260s in the code
+        sample_size=(260, 256) if config.flatten_music else (128, 256),
         in_channels=1 if config.flatten_music else 4,
         out_channels=1 if config.flatten_music else 4,
         layers_per_block=2,
@@ -315,7 +320,7 @@ def main():
         model.train()
         epoch_loss = 0.0
         for batch in tqdm(train_loader, desc=f'Epoch {epoch + 1}/{config.num_epochs}'):
-            # Batch shape: (batch_size, 4, 128, 256) if flatten_music is False, else (batch_size, 1, X=258, 256)
+            # Batch shape: (batch_size, 4, 128, 256) if flatten_music is False, else (batch_size, 1, X=260, 256)
             step_count += 1
             optimizer.zero_grad()
 

@@ -3,13 +3,18 @@ import numpy as np
 
 
 # Simulating whatever the heck nesmdb and vgm is doing
+def get_note_ranges():
+    note_min = [32, 32, 21, 1]
+    note_max = [108, 108, 108, 16]
+    return note_min, note_max
+
+
 def img2exprsco(img):
     _, num_times, num_channels = img.shape
     exprsco = np.zeros((num_times, 4, 3), dtype=np.uint8)
     for T in range(num_times):
         for C in range(num_channels):
-            note_min = [32, 32, 21, 1]
-            note_max = [108, 108, 108, 16]
+            note_min, note_max = get_note_ranges()
             if sum(img[note_min[C]:(note_max[C]+1), T, C]) == 0:
                 continue
             note = np.argmax(img[note_min[C]:(note_max[C]+1), T, C]) + note_min[C]
@@ -102,24 +107,27 @@ def batch_convert(batch: torch.Tensor, tickrate: int = 24, sr: int = 44100) -> n
     return np.array(outputs, dtype=np.float32)
 
 
-def flatten_batch(batch: torch.Tensor) -> torch.Tensor:
+def flatten_batch(batch: torch.Tensor, target_x: int | None = None) -> torch.Tensor:
     """Flatten the batch of images."""
     batch_size = batch.shape[0]
     assert batch.shape == (batch_size, 4, 128, 256), f"Batch shape should be (batch_size, 4, 128, 256) but got {batch.shape}"
-    note_min = [32, 32, 21, 1]
-    note_max = [108, 108, 108, 16]
+    note_min, note_max = get_note_ranges()
+    note_count = sum([upper - lower + 1 for lower, upper in zip(note_min, note_max)])
+    if target_x is None:
+        target_x = note_count
+    padding = target_x - note_count
+    if padding < 0:
+        raise ValueError(f"Target x {target_x} is less than the number of notes {note_count}.")
     fillable_ranges = [batch[:, i, lower:upper + 1] for i, (lower, upper) in enumerate(zip(note_min, note_max))]
-    print([f.shape for f in fillable_ranges])
+    fillable_ranges += [torch.zeros((batch_size, padding, 256), dtype=batch.dtype, device=batch.device)]
     flattened = torch.concatenate(fillable_ranges, dim=1)
-    print(flattened.shape)
     return flattened
 
 
 def unflatten_batch(batch: torch.Tensor) -> torch.Tensor:
     batch_size = batch.shape[0]
     assert batch.shape[2] == 256, f"Batch shape should be (batch_size, X, 256) but got {batch.shape}"
-    note_min = [32, 32, 21, 1]
-    note_max = [108, 108, 108, 16]
+    note_min, note_max = get_note_ranges()
     unflattened = torch.zeros((batch_size, 4, 128, 256), dtype=batch.dtype, device=batch.device)
     start = 0
     for i, (lower, upper) in enumerate(zip(note_min, note_max)):
