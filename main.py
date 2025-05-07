@@ -8,7 +8,7 @@ import wandb
 from dataclasses import asdict
 from dataclasses import dataclass
 from datasets import load_dataset
-from diffusers import DDPMScheduler, UNet2DModel, DDIMScheduler
+from diffusers import DDPMScheduler, UNet2DModel, DDIMScheduler   # type: ignore
 from dotenv import load_dotenv
 from math import ceil
 from torchvision import datasets, transforms
@@ -194,8 +194,8 @@ def infer(config: COMP5421Config, batch: torch.Tensor, model: UNet2DModel, noise
     noise = torch.randn_like(batch)
     if config.prune_gradients:
         silence_notes_(noise)
-    timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (batch.size(0),), device=device, dtype=torch.int64)
-    noisy_batch = noise_scheduler.add_noise(batch, noise, timesteps)
+    timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (batch.size(0),), device=device, dtype=torch.int64)   # type: ignore
+    noisy_batch = noise_scheduler.add_noise(batch, noise, timesteps)   # type: ignore
     noise_pred = model(noisy_batch, timesteps)[0]
     if config.prune_gradients:
         silence_notes_(noise_pred)
@@ -219,7 +219,7 @@ def validate(
         val_loss += loss
         if val_count >= config.val_step:
             break
-    return val_loss / val_count
+    return val_loss / val_count   # type: ignore
 
 
 def save_model(config: COMP5421Config, model: UNet2DModel, step_count: int):
@@ -256,7 +256,7 @@ def log_audio(model: UNet2DModel, config: COMP5421Config, device: torch.device, 
             timestep_tensor = timestep_tensor.expand(latents.shape[0])
             noise_pred = model(model_input, timestep_tensor)[0]
 
-            latents = sampler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
+            latents = sampler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample   # type: ignore
 
     if config.flatten_music:
         # undo the padding
@@ -310,7 +310,7 @@ def main():
         step_count = 0
         print("Starting training anew...")
 
-    model = model.to(device)
+    model = model.to(device)   # type: ignore
     model.train()
 
     # Load dataset
