@@ -4,7 +4,6 @@ import argparse
 import huggingface_hub
 import numpy as np
 import torch
-import torch.nn.functional as F
 import wandb
 from dataclasses import asdict
 from dataclasses import dataclass
@@ -12,7 +11,6 @@ from datasets import load_dataset
 from diffusers import DDPMScheduler, UNet2DModel, DDIMScheduler   # type: ignore
 from dotenv import load_dotenv
 from math import ceil
-from torch import nn
 from torchvision import datasets, transforms
 from torchvision.utils import make_grid
 from torch.utils.data import DataLoader
@@ -33,13 +31,9 @@ class COMP5421Config():
     dataset_src: str
     training_name: str
     grad_accumulation_iters: int        # Accumulate gradients over n iterations
-    load_model_from: str | None
-    loss: str                           # Loss function to use, can be "mse" or "sparse bce"
-
-    # Model
-    predict_actual: bool                # Predict the actual image instead of the noise added to the image
     flatten_music: bool                 # Flatten the music dataset to a single channel by layering all notes on top of each other
     prune_gradients: bool               # Prune the gradients at the places where the notes are not supposed to sound
+    load_model_from: str | None
 
     # Validation
     val_size: float
@@ -66,12 +60,9 @@ class COMP5421Config():
         parser.add_argument("--dataset_src", type=str, default="./exprsco2img.npz", help="Dataset source")
         parser.add_argument("--training_name", type=str, default="comp5421-nes", help="Name of the training run")
         parser.add_argument("--grad_accumulation_iters", type=int, default=2, help="Gradient accumulation steps")
-        parser.add_argument("--load_model_from", type=str, default=None, help="Checkpoint to load model from")
-        parser.add_argument("--loss", type=str, default="mse", choices=["mse", "sparse bce"], help="Loss function to use")
-
-        parser.add_argument("--predict_actual", action="store_true", help="Predict the actual image instead of the noise added to the image")
         parser.add_argument("--flatten_music", action="store_true", help="Flatten the music dataset to a single channel by layering all notes on top of each other")
         parser.add_argument("--no-prune_gradients", action="store_false", dest="prune_gradients", help="Prune the gradients at the places where the notes are not supposed to sound")
+        parser.add_argument("--load_model_from", type=str, default=None, help="Checkpoint to load model from")
 
         parser.add_argument("--val_size", type=float, default=0.1, help="Validation set size as a fraction of the dataset")
         parser.add_argument("--val_step", type=int, default=128, help="Validation step frequency")
@@ -126,21 +117,6 @@ class COMP5421Dataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         return self.datafiles[idx]
-
-
-class SparseBCELoss(nn.Module):
-    def __init__(self, lambda_penalty=0.1, threshold=0.5):
-        super(SparseBCELoss, self).__init__()
-        self.bce_loss = nn.BCELoss()
-        self.lambda_penalty = lambda_penalty
-        self.threshold = threshold
-
-    def forward(self, outputs, targets):
-        bce_loss = self.bce_loss(outputs, targets)
-        sparsity_penalty = (outputs > self.threshold).float().sum(dim=1) - 1
-        sparsity_penalty = torch.clamp(sparsity_penalty, min=0).mean()
-        total_loss = bce_loss + self.lambda_penalty * sparsity_penalty
-        return total_loss
 
 
 def sanity_check(batch: torch.Tensor):
@@ -213,7 +189,7 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
-def infer(config: COMP5421Config, batch: torch.Tensor, model: UNet2DModel, noise_scheduler: DDPMScheduler, device: torch.device):
+def infer(config: COMP5421Config, batch: torch.Tensor, model: UNet2DModel, noise_scheduler: DDPMScheduler, loss_func: torch.nn.Module, device: torch.device):
     batch = batch.to(device)
     noise = torch.randn_like(batch)
     if config.prune_gradients:
@@ -223,14 +199,7 @@ def infer(config: COMP5421Config, batch: torch.Tensor, model: UNet2DModel, noise
     noise_pred = model(noisy_batch, timesteps)[0]
     if config.prune_gradients:
         silence_notes_(noise_pred)
-    target = batch if config.predict_actual else noise
-    if config.loss == "sparse bce":
-        loss_func = SparseBCELoss()
-        loss = loss_func(noise_pred, target)
-    elif config.loss == "mse":
-        loss = F.mse_loss(noise_pred, target)
-    else:
-        raise ValueError(f"Unknown loss function: {config.loss}")
+    loss = loss_func(noise_pred, noise)
     return loss
 
 
@@ -239,13 +208,14 @@ def validate(
     model: UNet2DModel,
     loader: DataLoader,
     noise_scheduler: DDPMScheduler,
+    loss_func: torch.nn.Module,
     device: torch.device
 ) -> torch.Tensor:
     val_loss = 0.0
     val_count = 0
     for val_batch in tqdm(loader, desc="Validating...", total=config.val_step):
         val_count += 1
-        loss = infer(config, val_batch, model, noise_scheduler, device)
+        loss = infer(config, val_batch, model, noise_scheduler, loss_func, device)
         val_loss += loss
         if val_count >= config.val_step:
             break
@@ -286,11 +256,7 @@ def log_audio(model: UNet2DModel, config: COMP5421Config, device: torch.device, 
             timestep_tensor = timestep_tensor.expand(latents.shape[0])
             noise_pred = model(model_input, timestep_tensor)[0]
 
-            if config.predict_actual:
-                if i < timesteps.shape[0] - 1:
-                    latents = sampler.add_noise(latents, noise_pred, t)   # type: ignore
-            else:
-                latents = sampler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample   # type: ignore
+            latents = sampler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample   # type: ignore
 
     if config.flatten_music:
         # undo the padding
@@ -377,7 +343,7 @@ def main():
             # Batch shape: (batch_size, 4, 128, 256) if flatten_music is False, else (batch_size, 1, X=260, 256)
             step_count += 1
             optimizer.zero_grad()
-            loss = infer(config, batch, model, noise_scheduler, device)
+            loss = infer(config, batch, model, noise_scheduler, loss_func, device)
             loss.backward()
 
             if ((step_count + 1) % config.grad_accumulation_iters == 0):
@@ -387,7 +353,7 @@ def main():
             if step_count > 0 and step_count % config.val_step == 0:
                 with torch.no_grad():
                     try:
-                        val_loss = validate(config, model, val_loader, noise_scheduler, device)
+                        val_loss = validate(config, model, val_loader, noise_scheduler, loss_func, device)
                         wandb.log({"val_batch_loss": val_loss.item()}, step=step_count)
                     except Exception as e:
                         tqdm.write(f"Failed to perform validation... {e}")
