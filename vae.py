@@ -46,6 +46,7 @@ class COMP5421Config():
     # Validation
     val_size: float
     val_step: int                       # Validate every n steps
+    log_step: int                       # Log every n steps
 
     # Logging
     save_step: int
@@ -63,7 +64,6 @@ class COMP5421Config():
         parser.add_argument("--hidden_dims", type=int, nargs='+', default=(512, 256, 128), help="Hidden (down) dimensions for the model")
 
         parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training")
-        parser.add_argument("--latent_dim", type=int, default=128, help="Latent dimension for the model")
         parser.add_argument("--num_epochs", type=int, default=10, help="Number of epochs to train")
         parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate for the optimizer")
         parser.add_argument("--dataset_src", type=str, default="./exprsco2img.npz", help="Dataset source")
@@ -76,10 +76,11 @@ class COMP5421Config():
         parser.add_argument("--sparsity_lambda", type=float, default=0.5, help="Sparsity penalty weight")
 
         parser.add_argument("--val_size", type=float, default=0.1, help="Validation set size as a fraction of the dataset")
-        parser.add_argument("--val_step", type=int, default=64, help="Validation step frequency")
+        parser.add_argument("--val_step", type=int, default=4096, help="Validation step frequency")
 
         parser.add_argument("--save_step", type=int, default=4096, help="Model save step frequency")
         parser.add_argument("--save_dir", type=str, default="./checkpoints", help="Directory to save checkpoints")
+        parser.add_argument("--log_step", type=int, default=128, help="Logging step frequency")
 
         parser.add_argument("--seed", type=int, default=5421, help="Random seed for reproducibility")
 
@@ -105,7 +106,6 @@ class COMP5421Dataset(torch.utils.data.Dataset):
             for i in range((self.img_dims[1] // config.time_frames_step)):
                 if i * config.time_frames_step + config.time_frames <= self.img_dims[1]:
                     self.indices.append((index, i * config.time_frames_step))
-            self.indices.append(index)
 
         # Apply the sanity check only on the first load
         self._check = set()
@@ -138,7 +138,7 @@ class COMP5421VAE(torch.nn.Module):
                 encoder_layers.append(nn.Linear(hidden_dims[i], hidden_dims[i]))
             else:
                 encoder_layers.append(nn.Linear(hidden_dims[i], hidden_dims[i + 1]))
-                encoder_layers.append(nn.ReLU())
+                encoder_layers.append(nn.LeakyReLU(0.2))
         self.encoder = nn.Sequential(*encoder_layers)
         decoder_layers = []
         hidden_dims = [self.config.latent_dim] + list(config.hidden_dims[::-1]) + [self.input_dims]
@@ -147,7 +147,7 @@ class COMP5421VAE(torch.nn.Module):
                 decoder_layers.append(nn.Linear(hidden_dims[i], hidden_dims[i]))
             else:
                 decoder_layers.append(nn.Linear(hidden_dims[i], hidden_dims[i + 1]))
-                decoder_layers.append(nn.ReLU())
+                decoder_layers.append(nn.LeakyReLU(0.2))
         self.decoder = nn.Sequential(*decoder_layers)
 
     def run(self, x: torch.Tensor):
@@ -157,19 +157,20 @@ class COMP5421VAE(torch.nn.Module):
         note_min, note_max = get_note_ranges()
         fillable_ranges = [x[:, i, lower:upper + 1] for i, (lower, upper) in enumerate(zip(note_min, note_max))]
         x = torch.cat(fillable_ranges, dim=1)
+        time_frames = x.shape[2]
         x = x.view(x.shape[0], -1)
         x = self.encoder(x)
         mu, logvar = x[:, :self.config.latent_dim], x[:, self.config.latent_dim:]
 
         z = mu + torch.exp(logvar / 2) * torch.randn_like(mu)
-        x = self.decoder(z)
+        xdec = self.decoder(z).view(original_shape[0], -1, time_frames)
+        xdec = F.relu(xdec)  # Add this relu
         y = torch.zeros(original_shape, dtype=x.dtype, device=x.device)
         start = 0
         for i, (lower, upper) in enumerate(zip(note_min, note_max)):
             range_size = upper - lower + 1
-            y[:, i, lower:upper + 1] = x[:, start:start + range_size]
+            y[:, i, lower:upper + 1] = xdec[:, start:start + range_size]
             start += range_size
-
         return mu, logvar, y
 
     def forward(self, x: torch.Tensor):
@@ -182,8 +183,13 @@ class COMP5421VAE(torch.nn.Module):
 def infer(config: COMP5421Config, batch: torch.Tensor, model: COMP5421VAE, device: torch.device):
     batch = batch.to(device)
     y, kl = model(batch)
-    l2 = F.mse_loss(batch, y, reduction="mean")
-    sparsity_penalty = (y > config.sparsity_threshold).float().sum(dim=1) - 4  # Allow at most 4 notes per time frame (for 4 instruments)
+
+    note_min, note_max = get_note_ranges()
+    note_count = sum([upper - lower + 1 for lower, upper in zip(note_min, note_max)])
+    l2 = F.mse_loss(batch, y, reduction="sum")
+    l2 /= note_count * config.time_frames  # Effectively mean reduction but we can calculate it here instead of inside the model
+
+    sparsity_penalty = (y > config.sparsity_threshold).float().sum(dim=(1, 2)) - 4  # Allow at most 4 notes per time frame (for 4 instruments)
     sparsity_penalty = torch.clamp(sparsity_penalty, min=0).mean()
     loss = l2 + config.kl_regularization * kl + config.sparsity_lambda * sparsity_penalty
     return loss
@@ -236,6 +242,9 @@ def main():
         step_count = 0
         print("Starting training anew...")
 
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters())}")
+    print(f"Model device: {device}")
+
     model = model.to(device)   # type: ignore
 
     # Load dataset
@@ -282,7 +291,9 @@ def main():
                 save_model(config, model, step_count)
 
             epoch_loss += loss.item()
-            wandb.log({"batch_loss": loss.item()}, step=step_count)
+
+            if step_count % config.log_step == 0:
+                wandb.log({"batch_loss": loss.item()}, step=step_count)
 
         optimizer.step()
         optimizer.zero_grad()
