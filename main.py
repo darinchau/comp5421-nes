@@ -31,7 +31,6 @@ class COMP5421Config():
     dataset_src: str
     training_name: str
     grad_accumulation_iters: int        # Accumulate gradients over n iterations
-    flatten_music: bool                 # Flatten the music dataset to a single channel by layering all notes on top of each other
     prune_gradients: bool               # Prune the gradients at the places where the notes are not supposed to sound
     load_model_from: str | None
 
@@ -60,7 +59,6 @@ class COMP5421Config():
         parser.add_argument("--dataset_src", type=str, default="./exprsco2img.npz", help="Dataset source")
         parser.add_argument("--training_name", type=str, default="comp5421-nes", help="Name of the training run")
         parser.add_argument("--grad_accumulation_iters", type=int, default=2, help="Gradient accumulation steps")
-        parser.add_argument("--flatten_music", action="store_true", help="Flatten the music dataset to a single channel by layering all notes on top of each other")
         parser.add_argument("--no-prune_gradients", action="store_false", dest="prune_gradients", help="Prune the gradients at the places where the notes are not supposed to sound")
         parser.add_argument("--load_model_from", type=str, default=None, help="Checkpoint to load model from")
 
@@ -87,36 +85,31 @@ class COMP5421Dataset(torch.utils.data.Dataset):
         print("Loading dataset...")
 
         path = config.dataset_src
-        data = np.load(path)
+        self.data = np.load(path)
 
-        datafiles = []
-        indices = []
-        frames = []
+        self.indices = []
+        self.frames = []
 
-        for test_index in trange(len(data.files), desc="Loading dataset from npz..."):
-            index = data.files[test_index]
-            test_img = data[index]
+        for test_index in range(len(self.data.files)):
+            index = self.data.files[test_index]
             nsamples = int(index.split(".pkl_")[1])
-            datafiles.append(test_img)
-            indices.append(index)
-            frames.append(nsamples)
+            self.indices.append(index)
+            self.frames.append(nsamples)
 
-        datafiles = np.array(datafiles)
-        self.datafiles = torch.tensor(datafiles, dtype=torch.float32)
-        self.indices = indices
-        self.datafiles = self.datafiles.permute(0, 3, 1, 2).contiguous()  # NCFT
-        self.frames = frames
-
-        sanity_check(self.datafiles)
-
-        if config.flatten_music:
-            self.datafiles = flatten_batch(self.datafiles, target_x=260).unsqueeze(1).contiguous()
+        # Apply the sanity check only on the first load
+        self._check = set()
 
     def __len__(self):
         return len(self.indices)
 
     def __getitem__(self, idx):
-        return self.datafiles[idx]
+        index = self.indices[idx]
+        data = self.data[index]
+        data = torch.from_numpy(data).float().permute(2, 0, 1).contiguous()  # NCFT
+        if index not in self._check:
+            sanity_check(data.unsqueeze(0))
+            self._check.add(index)
+        return data
 
 
 def sanity_check(batch: torch.Tensor):
@@ -134,16 +127,12 @@ def sanity_check(batch: torch.Tensor):
 
 
 def silence_notes_(batch: torch.Tensor):
-    assert len(batch.shape) == 4, f"Batch shape should be (batch_size, 4, 128, 256) or (batch_size, 1, X, 256), but got {batch.shape}"
-    assert batch.shape[1] in [1, 4], f"Batch shape should be (batch_size, 4, 128, 256) or (batch_size, 1, X, 256), but got {batch.shape}"
-    if batch.shape[1] == 4:
-        note_min, note_max = get_note_ranges()
-        for i in range(4):
-            for j in range(128):
-                if not (note_min[i] <= j <= note_max[i]):
-                    batch[:, i, j] = 0
-    else:
-        batch[:, :, 258:] = 0  # silence the padding notes
+    assert batch.shape == (batch.shape[0], 4, 128, 256), f"Batch shape should be (batch_size, 4, 128, 256) but got {batch.shape}"
+    note_min, note_max = get_note_ranges()
+    for i in range(4):
+        for j in range(128):
+            if not (note_min[i] <= j <= note_max[i]):
+                batch[:, i, j] = 0
 
 
 def enforce_constraints(batch: torch.Tensor, keep_max_note_only: bool = True, quantize: bool = True, check: bool = True) -> torch.Tensor:
@@ -235,10 +224,7 @@ def log_audio(model: UNet2DModel, config: COMP5421Config, device: torch.device, 
         num_train_timesteps=config.num_train_timesteps
     )
 
-    if config.flatten_music:
-        latents = torch.randn((sampling_bs, 1, 260, 256), device=device, generator=generator, dtype=torch.float32)
-    else:
-        latents = torch.randn((sampling_bs, 4, 128, 256), device=device, generator=generator, dtype=torch.float32)
+    latents = torch.randn((sampling_bs, 4, 128, 256), device=device, generator=generator, dtype=torch.float32)
     latents = latents * sampler.init_noise_sigma
     sampler.set_timesteps(steps)
     timesteps = sampler.timesteps.to(device)
@@ -257,11 +243,6 @@ def log_audio(model: UNet2DModel, config: COMP5421Config, device: torch.device, 
             noise_pred = model(model_input, timestep_tensor)[0]
 
             latents = sampler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample   # type: ignore
-
-    if config.flatten_music:
-        # undo the padding
-        latents = latents[:, 0, :258, :]
-        latents = unflatten_batch(latents)
 
     latents = enforce_constraints(latents, keep_max_note_only=config.trim_audio_on_log, quantize=config.quantize_audio_on_log, check=True)
     audios = batch_convert(latents, tickrate=24, sr=44100)
@@ -289,13 +270,9 @@ def main():
         os.makedirs(config.save_dir)
 
     model = UNet2DModel(
-        # TODO allow to change this programmatically
-        # 260 is calculated from 258 notes + 2 for the padding to make it a multiple of 2 ** (len(block_out_channels) - 1)
-        # I am too tired to not hard code this right now
-        # Just be weary of all the 258s and 260s in the code
-        sample_size=(260, 256) if config.flatten_music else (128, 256),
-        in_channels=1 if config.flatten_music else 4,
-        out_channels=1 if config.flatten_music else 4,
+        sample_size=(128, 256),
+        in_channels=4,
+        out_channels=4,
         layers_per_block=2,
         block_out_channels=(32, 64, 64),
         down_block_types=("DownBlock2D", "AttnDownBlock2D", "DownBlock2D"),
@@ -340,7 +317,6 @@ def main():
         model.train()
         epoch_loss = 0.0
         for batch in tqdm(train_loader, desc=f'Epoch {epoch + 1}/{config.num_epochs}'):
-            # Batch shape: (batch_size, 4, 128, 256) if flatten_music is False, else (batch_size, 1, X=260, 256)
             step_count += 1
             optimizer.zero_grad()
             loss = infer(config, batch, model, noise_scheduler, loss_func, device)
