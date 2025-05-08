@@ -34,7 +34,6 @@ class COMP5421Config():
     batch_size: int
     num_epochs: int
     learning_rate: float
-    num_train_timesteps: int
     dataset_src: str
     training_name: str
     grad_accumulation_iters: int        # Accumulate gradients over n iterations
@@ -47,7 +46,6 @@ class COMP5421Config():
     # Validation
     val_size: float
     val_step: int                       # Validate every n steps
-    val_samples: float                  # Validate over n samples instead of the whole val set
 
     # Logging
     log_audio_count: int                # Number of audio samples to log
@@ -69,7 +67,6 @@ class COMP5421Config():
         parser.add_argument("--latent_dim", type=int, default=128, help="Latent dimension for the model")
         parser.add_argument("--num_epochs", type=int, default=10, help="Number of epochs to train")
         parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate for the optimizer")
-        parser.add_argument("--num_train_timesteps", type=int, default=1000, help="Number of training timesteps for the scheduler")
         parser.add_argument("--dataset_src", type=str, default="./exprsco2img.npz", help="Dataset source")
         parser.add_argument("--training_name", type=str, default="comp5421-nes-vae", help="Name of the training run")
         parser.add_argument("--grad_accumulation_iters", type=int, default=2, help="Gradient accumulation steps")
@@ -80,8 +77,7 @@ class COMP5421Config():
         parser.add_argument("--sparsity_lambda", type=float, default=0.5, help="Sparsity penalty weight")
 
         parser.add_argument("--val_size", type=float, default=0.1, help="Validation set size as a fraction of the dataset")
-        parser.add_argument("--val_step", type=int, default=128, help="Validation step frequency")
-        parser.add_argument("--val_samples", type=float, default=0.1, help="Number of samples to validate over")
+        parser.add_argument("--val_step", type=int, default=64, help="Validation step frequency")
 
         parser.add_argument("--log_audio_count", type=int, default=4, help="Number of audio samples to log")
         parser.add_argument("--save_step", type=int, default=4096, help="Model save step frequency")
@@ -236,10 +232,8 @@ def validate(
 
 def save_model(config: COMP5421Config, model: COMP5421VAE, step_count: int):
     save_path = os.path.join(config.save_dir, f"{config.training_name}-{config.dataset_src.split('/')[1]}-step-{step_count}")
-
-
-def log_generation(model: COMP5421VAE, config: COMP5421Config, device: torch.device, step_count: int):
-    raise NotImplementedError("Generation logging is not implemented yet.")
+    torch.save(model.state_dict(), save_path)
+    print(f"Model saved to {save_path}")
 
 
 def main():
@@ -286,8 +280,6 @@ def main():
         config=asdict(config)
     )
 
-    log_generation(model, config, device, step_count)
-
     # Training Loop
     for epoch in range(config.num_epochs):
         model.train()
@@ -322,7 +314,6 @@ def main():
         average_epoch_loss = epoch_loss / len(train_loader)
         print(f'Epoch {epoch + 1} completed, Average Loss: {average_epoch_loss}')
         save_model(config, model, step_count)
-        log_generation(model, config, device, step_count)
         wandb.log({"epoch_loss": average_epoch_loss}, step=step_count)
 
     save_model(config, model, step_count)
