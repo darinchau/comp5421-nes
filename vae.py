@@ -16,7 +16,7 @@ from torchvision.utils import make_grid
 from torch.utils.data import DataLoader
 from torch import nn
 from tqdm import tqdm, trange
-from utils import batch_convert, get_note_ranges
+from utils import batch_convert, get_note_ranges, check_batch, set_seed
 
 load_dotenv()
 huggingface_hub.login(os.getenv("HF_TOKEN"))
@@ -48,7 +48,6 @@ class COMP5421Config():
     val_step: int                       # Validate every n steps
 
     # Logging
-    log_audio_count: int                # Number of audio samples to log
     save_step: int
     save_dir: str
 
@@ -79,7 +78,6 @@ class COMP5421Config():
         parser.add_argument("--val_size", type=float, default=0.1, help="Validation set size as a fraction of the dataset")
         parser.add_argument("--val_step", type=int, default=64, help="Validation step frequency")
 
-        parser.add_argument("--log_audio_count", type=int, default=4, help="Number of audio samples to log")
         parser.add_argument("--save_step", type=int, default=4096, help="Model save step frequency")
         parser.add_argument("--save_dir", type=str, default="./checkpoints", help="Directory to save checkpoints")
 
@@ -121,7 +119,7 @@ class COMP5421Dataset(torch.utils.data.Dataset):
         data = self.data[index]
         data = torch.from_numpy(data).float().permute(2, 0, 1).contiguous()  # NCFT
         if index not in self._check:
-            sanity_check(data.unsqueeze(0))
+            check_batch(data.unsqueeze(0))
             self._check.add(index)
         return data[:, :, start:self.config.time_frames + start]  # (4, 128, T)
 
@@ -179,28 +177,6 @@ class COMP5421VAE(torch.nn.Module):
         mu, logvar, y = self.run(x)
         kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1).mean()
         return y, kl_loss
-
-
-def sanity_check(batch: torch.Tensor):
-    """Check the constraints of the dataset."""
-    batch_size = batch.shape[0]
-    assert batch.shape == (batch_size, 4, 128, 256), f"Batch shape should be (batch_size, 4, 128, 256) but got {batch.shape}"
-    assert batch.count_nonzero(dim=2).max() == 1., f"Each instrument should only have at most one note per time frame, found {batch.count_nonzero(dim=2).max()}"
-    assert torch.isclose((batch * 15).to(torch.int32).float(), batch * 15, atol=1e-5).all(), f"Instrument velocity should be 4-bit quantized"
-    d = batch.sum(0)
-    note_min, note_max = get_note_ranges()
-    for i in range(4):
-        for j in range(128):
-            if not (note_min[i] <= j <= note_max[i]):
-                assert d[i, j].sum() == 0, f"Note {j} should not be present in the dataset for instrument {i}"
-
-
-def set_seed(seed: int):
-    """Set the random seed for reproducibility."""
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
 
 
 def infer(config: COMP5421Config, batch: torch.Tensor, model: COMP5421VAE, device: torch.device):

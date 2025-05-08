@@ -135,3 +135,25 @@ def unflatten_batch(batch: torch.Tensor) -> torch.Tensor:
         unflattened[:, i, lower:upper + 1] = batch[:, start:start + range_size]
         start += range_size
     return unflattened
+
+
+def check_batch(batch: torch.Tensor):
+    """Check the constraints of the dataset."""
+    batch_size = batch.shape[0]
+    assert batch.shape == (batch_size, 4, 128, 256), f"Batch shape should be (batch_size, 4, 128, 256) but got {batch.shape}"
+    assert batch.count_nonzero(dim=2).max() == 1., f"Each instrument should only have at most one note per time frame, found {batch.count_nonzero(dim=2).max()}"
+    assert torch.isclose((batch * 15).to(torch.int32).float(), batch * 15, atol=1e-5).all(), f"Instrument velocity should be 4-bit quantized"
+    d = batch.sum(0)
+    note_min, note_max = get_note_ranges()
+    for i in range(4):
+        for j in range(128):
+            if not (note_min[i] <= j <= note_max[i]):
+                assert d[i, j].sum() == 0, f"Note {j} should not be present in the dataset for instrument {i}"
+
+
+def set_seed(seed: int):
+    """Set the random seed for reproducibility."""
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
