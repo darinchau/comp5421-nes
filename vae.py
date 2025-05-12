@@ -29,7 +29,7 @@ class COMP5421Config():
     # Model
     time_frames: int
     time_frames_step: int
-    latent_dim: int
+    downsample_factor: tuple[int, ...]
     hidden_dims: tuple[int, ...]
 
     # Training
@@ -58,13 +58,16 @@ class COMP5421Config():
     # Miscellaneous
     seed: int = 5421                    # Random seed for reproducibility
 
+    def __post_init__(self):
+        assert len(self.downsample_factor) == len(self.hidden_dims), "Downsample factor and hidden dimensions must have same length"
+
     @classmethod
     def parse(cls):
         parser = argparse.ArgumentParser(description="Training configuration")
         parser.add_argument("--time_frames", type=int, default=2, help="Number of time frames in the input data")
         parser.add_argument("--time_frames_step", type=int, default=1, help="Step size for time frames")
-        parser.add_argument("--latent_dim", type=int, default=128, help="Latent dimension for the model")
-        parser.add_argument("--hidden_dims", type=int, nargs='+', default=(512, 256), help="Hidden (down) dimensions for the model")
+        parser.add_argument("--downsample_factor", type=int, nargs='+', default=(1, 2, 2), help="Downsample factor for the model")
+        parser.add_argument("--hidden_dims", type=int, nargs='+', default=(32, 64, 128), help="Hidden (down) dimensions for the model")
 
         parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training")
         parser.add_argument("--num_epochs", type=int, default=10, help="Number of epochs to train")
@@ -100,88 +103,81 @@ class COMP5421Dataset(torch.utils.data.Dataset):
         self.data = np.load(path)
 
         self.indices = []
-        self.img_dims = None
+        self.frames = []
 
         for test_index in range(len(self.data.files)):
             index = self.data.files[test_index]
-            if self.img_dims is None:
-                data = self.data[index]
-                self.img_dims = data.shape
-            for i in range((self.img_dims[1] // config.time_frames_step)):
-                if i * config.time_frames_step + config.time_frames <= self.img_dims[1]:
-                    self.indices.append((index, i * config.time_frames_step))
+            nsamples = int(index.split(".pkl_")[1])
+            self.indices.append(index)
+            self.frames.append(nsamples)
 
         # Apply the sanity check only on the first load
         self._check = set()
-        self.config = config
 
     def __len__(self):
         return len(self.indices)
 
     def __getitem__(self, idx):
-        index, start = self.indices[idx]
+        index = self.indices[idx]
         data = self.data[index]
         data = torch.from_numpy(data).float().permute(2, 0, 1).contiguous()  # NCFT
         if index not in self._check:
             check_batch(data.unsqueeze(0))
             self._check.add(index)
-        return data[:, :, start:self.config.time_frames + start]  # (4, 128, T)
+        return data
 
 
 class COMP5421VAE(torch.nn.Module):
     def __init__(self, config: COMP5421Config):
         super().__init__()
         self.config = config
-        note_min, note_max = get_note_ranges()
-        note_count = sum([upper - lower + 1 for lower, upper in zip(note_min, note_max)])
-        self.input_dims = note_count * self.config.time_frames
-        encoder_layers = []
-        hidden_dims = [self.input_dims] + list(config.hidden_dims) + [2 * self.config.latent_dim]
-        for i in range(len(hidden_dims)):
-            if i == len(hidden_dims) - 1:
-                encoder_layers.append(nn.Linear(hidden_dims[i], hidden_dims[i]))
-            else:
-                encoder_layers.append(nn.Linear(hidden_dims[i], hidden_dims[i + 1]))
-                encoder_layers.append(nn.LeakyReLU(0.2))
-        self.encoder = nn.Sequential(*encoder_layers)
-        decoder_layers = []
-        hidden_dims = [self.config.latent_dim] + list(config.hidden_dims[::-1]) + [self.input_dims]
-        for i in range(len(hidden_dims)):
-            if i == len(hidden_dims) - 1:
-                decoder_layers.append(nn.Linear(hidden_dims[i], hidden_dims[i]))
-            else:
-                decoder_layers.append(nn.Linear(hidden_dims[i], hidden_dims[i + 1]))
-                decoder_layers.append(nn.LeakyReLU(0.2))
-        self.decoder = nn.Sequential(*decoder_layers)
+        dims = [4] + list(config.hidden_dims)
+        self.downsample = nn.ModuleList()
+        for i in range(len(config.downsample_factor)):
+            self.downsample.append(nn.Conv2d(dims[i], dims[i + 1], kernel_size=3, stride=1, padding=1))
+            self.downsample.append(nn.LeakyReLU(0.2))
+            self.downsample.append(nn.AvgPool2d(kernel_size=config.downsample_factor[i], stride=config.downsample_factor[i]))
+            self.downsample.append(nn.BatchNorm2d(dims[i + 1]))
+        self.downsample = nn.Sequential(*self.downsample)
+        self.pre_conv = nn.Conv2d(dims[-1], 2, kernel_size=3, stride=1, padding=1)
 
-    def run(self, x: torch.Tensor):
-        """Run the VAE model."""
-        # Extract the nonsilent part of the input here
-        original_shape = x.shape
-        note_min, note_max = get_note_ranges()
-        fillable_ranges = [x[:, i, lower:upper + 1] for i, (lower, upper) in enumerate(zip(note_min, note_max))]
-        x = torch.cat(fillable_ranges, dim=1)
-        time_frames = x.shape[2]
-        x = x.view(x.shape[0], -1)
-        x = self.encoder(x)
-        mu, logvar = x[:, :self.config.latent_dim], x[:, self.config.latent_dim:]
+        self.post_conv = nn.Conv2d(1, dims[-1], kernel_size=3, stride=1, padding=1)
+        self.upconv = nn.ModuleList()
+        for i in range(len(config.downsample_factor) - 1, -1, -1):
+            self.upconv.append(nn.Upsample(scale_factor=config.downsample_factor[i], mode='nearest'))
+            self.upconv.append(nn.Conv2d(dims[i + 1], dims[i], kernel_size=3, stride=1, padding=1))
+            self.upconv.append(nn.LeakyReLU(0.2))
+            self.upconv.append(nn.BatchNorm2d(dims[i]))
+        self.upconv = nn.Sequential(*self.upconv)
+        self.final_conv = nn.Conv2d(dims[0], 4, kernel_size=3, stride=1, padding=1)
+        self.final_activation = nn.Sigmoid()
 
-        z = mu + torch.exp(logvar / 2) * torch.randn_like(mu)
-        xdec = self.decoder(z).view(original_shape[0], -1, time_frames)
-        xdec = xdec.square()  # Ensure the output is non-negative but try not to use ReLU to avoid dead neurons
-        y = torch.zeros(original_shape, dtype=x.dtype, device=x.device)
-        start = 0
-        for i, (lower, upper) in enumerate(zip(note_min, note_max)):
-            range_size = upper - lower + 1
-            y[:, i, lower:upper + 1] = xdec[:, start:start + range_size]
-            start += range_size
-        return mu, logvar, y
+    def encode(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        x = self.downsample(x)
+        x = self.pre_conv(x)
+        mu = x[:, 0:1, :, :]
+        logvar = x[:, 1:2, :, :]
+        return mu, logvar
 
-    def forward(self, x: torch.Tensor):
-        """Forward pass of the VAE model."""
-        mu, logvar, y = self.run(x)
-        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1).mean()
-        return y, kl_loss
+    def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def decode(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.post_conv(x)
+        x = F.leaky_relu(x, 0.2)
+        for upconv in self.upconv:
+            x = upconv(x)
+        x = self.final_conv(x)
+        return self.final_activation(x)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        x = self.decode(z)
+        kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+        return x, kl
 
 
 def infer(config: COMP5421Config, batch: torch.Tensor, model: COMP5421VAE, device: torch.device):
@@ -193,13 +189,10 @@ def infer(config: COMP5421Config, batch: torch.Tensor, model: COMP5421VAE, devic
     l2 = F.mse_loss(batch, y, reduction="sum")
     l2 /= note_count * config.time_frames  # Effectively mean reduction but we can calculate it here instead of inside the model
 
-    sparsity_penalty = (y > config.sparsity_threshold).float().sum(dim=(1, 2)) - 4  # Allow at most 4 notes per time frame (for 4 instruments)
-    sparsity_penalty = torch.clamp(sparsity_penalty, min=0).mean()
-    loss = l2 + config.kl_regularization * kl + config.sparsity_lambda * sparsity_penalty
+    loss = l2 + config.kl_regularization * kl
     components = {
         "l2": l2.item(),
         "kl": kl.item(),
-        "sp": sparsity_penalty.item()
     }
     return loss, components
 
