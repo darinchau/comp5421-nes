@@ -27,8 +27,6 @@ huggingface_hub.login(os.getenv("HF_TOKEN"))
 @dataclass(frozen=True)
 class COMP5421Config():
     # Model
-    time_frames: int
-    time_frames_step: int
     downsample_factor: tuple[int, ...]
     hidden_dims: tuple[int, ...]
 
@@ -64,8 +62,6 @@ class COMP5421Config():
     @classmethod
     def parse(cls):
         parser = argparse.ArgumentParser(description="Training configuration")
-        parser.add_argument("--time_frames", type=int, default=2, help="Number of time frames in the input data")
-        parser.add_argument("--time_frames_step", type=int, default=1, help="Step size for time frames")
         parser.add_argument("--downsample_factor", type=int, nargs='+', default=(1, 2, 2), help="Downsample factor for the model")
         parser.add_argument("--hidden_dims", type=int, nargs='+', default=(32, 64, 128), help="Hidden (down) dimensions for the model")
 
@@ -82,9 +78,9 @@ class COMP5421Config():
         parser.add_argument("--sparsity_lambda", type=float, default=0.5, help="Sparsity penalty weight")
 
         parser.add_argument("--val_size", type=float, default=0.1, help="Validation set size as a fraction of the dataset")
-        parser.add_argument("--val_step", type=int, default=4096, help="Validation step frequency")
+        parser.add_argument("--val_step", type=int, default=128, help="Validation step frequency")
         parser.add_argument("--val_count", type=int, default=128, help="Number of validation batches to use")
-        parser.add_argument("--log_step", type=int, default=128, help="Logging step frequency")
+        parser.add_argument("--log_step", type=int, default=1, help="Logging step frequency")
 
         parser.add_argument("--save_step", type=int, default=4096, help="Model save step frequency")
         parser.add_argument("--save_dir", type=str, default="./checkpoints", help="Directory to save checkpoints")
@@ -184,10 +180,7 @@ def infer(config: COMP5421Config, batch: torch.Tensor, model: COMP5421VAE, devic
     batch = batch.to(device)
     y, kl = model(batch)
 
-    note_min, note_max = get_note_ranges()
-    note_count = sum([upper - lower + 1 for lower, upper in zip(note_min, note_max)])
-    l2 = F.mse_loss(batch, y, reduction="sum")
-    l2 /= note_count * config.time_frames  # Effectively mean reduction but we can calculate it here instead of inside the model
+    l2 = F.mse_loss(batch, y)
 
     loss = l2 + config.kl_regularization * kl
     components = {
