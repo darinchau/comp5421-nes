@@ -141,7 +141,7 @@ def check_batch(batch: torch.Tensor):
     """Check the constraints of the dataset."""
     batch_size = batch.shape[0]
     assert batch.shape == (batch_size, 4, 128, 256), f"Batch shape should be (batch_size, 4, 128, 256) but got {batch.shape}"
-    assert batch.count_nonzero(dim=2).max() == 1., f"Each instrument should only have at most one note per time frame, found {batch.count_nonzero(dim=2).max()}"
+    assert batch.count_nonzero(dim=2).max() <= 1., f"Each instrument should only have at most one note per time frame, found {batch.count_nonzero(dim=2).max()}"
     assert torch.isclose((batch * 15).to(torch.int32).float(), batch * 15, atol=1e-5).all(), f"Instrument velocity should be 4-bit quantized"
     d = batch.sum(0)
     note_min, note_max = get_note_ranges()

@@ -5,7 +5,9 @@ import huggingface_hub
 import numpy as np
 import torch
 import torch.nn.functional as F
+import traceback
 import wandb
+from collections import defaultdict
 from dataclasses import asdict
 from dataclasses import dataclass
 from datasets import load_dataset
@@ -44,8 +46,9 @@ class COMP5421Config():
     sparsity_lambda: float
 
     # Validation
-    val_size: float
+    val_size: float                     # Size of holdout dataset
     val_step: int                       # Validate every n steps
+    val_count: int                      # Number of validation batches to use
     log_step: int                       # Log every n steps
 
     # Logging
@@ -60,8 +63,8 @@ class COMP5421Config():
         parser = argparse.ArgumentParser(description="Training configuration")
         parser.add_argument("--time_frames", type=int, default=2, help="Number of time frames in the input data")
         parser.add_argument("--time_frames_step", type=int, default=1, help="Step size for time frames")
-        parser.add_argument("--latent_dim", type=int, default=64, help="Latent dimension for the model")
-        parser.add_argument("--hidden_dims", type=int, nargs='+', default=(512, 256, 128), help="Hidden (down) dimensions for the model")
+        parser.add_argument("--latent_dim", type=int, default=128, help="Latent dimension for the model")
+        parser.add_argument("--hidden_dims", type=int, nargs='+', default=(512, 256), help="Hidden (down) dimensions for the model")
 
         parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training")
         parser.add_argument("--num_epochs", type=int, default=10, help="Number of epochs to train")
@@ -77,10 +80,11 @@ class COMP5421Config():
 
         parser.add_argument("--val_size", type=float, default=0.1, help="Validation set size as a fraction of the dataset")
         parser.add_argument("--val_step", type=int, default=4096, help="Validation step frequency")
+        parser.add_argument("--val_count", type=int, default=128, help="Number of validation batches to use")
+        parser.add_argument("--log_step", type=int, default=128, help="Logging step frequency")
 
         parser.add_argument("--save_step", type=int, default=4096, help="Model save step frequency")
         parser.add_argument("--save_dir", type=str, default="./checkpoints", help="Directory to save checkpoints")
-        parser.add_argument("--log_step", type=int, default=128, help="Logging step frequency")
 
         parser.add_argument("--seed", type=int, default=5421, help="Random seed for reproducibility")
 
@@ -164,7 +168,7 @@ class COMP5421VAE(torch.nn.Module):
 
         z = mu + torch.exp(logvar / 2) * torch.randn_like(mu)
         xdec = self.decoder(z).view(original_shape[0], -1, time_frames)
-        xdec = F.relu(xdec)  # Add this relu
+        xdec = xdec.square()  # Ensure the output is non-negative but try not to use ReLU to avoid dead neurons
         y = torch.zeros(original_shape, dtype=x.dtype, device=x.device)
         start = 0
         for i, (lower, upper) in enumerate(zip(note_min, note_max)):
@@ -192,7 +196,12 @@ def infer(config: COMP5421Config, batch: torch.Tensor, model: COMP5421VAE, devic
     sparsity_penalty = (y > config.sparsity_threshold).float().sum(dim=(1, 2)) - 4  # Allow at most 4 notes per time frame (for 4 instruments)
     sparsity_penalty = torch.clamp(sparsity_penalty, min=0).mean()
     loss = l2 + config.kl_regularization * kl + config.sparsity_lambda * sparsity_penalty
-    return loss
+    components = {
+        "l2": l2.item(),
+        "kl": kl.item(),
+        "sp": sparsity_penalty.item()
+    }
+    return loss, components
 
 
 def validate(
@@ -200,16 +209,22 @@ def validate(
     model: COMP5421VAE,
     loader: DataLoader,
     device: torch.device
-) -> torch.Tensor:
+) -> dict[str, float]:
     val_loss = 0.0
     val_count = 0
-    for val_batch in tqdm(loader, desc="Validating...", total=config.val_step):
+    log_components = defaultdict(float)
+    for val_batch in tqdm(loader, desc="Validating...", total=config.val_count):
         val_count += 1
-        loss = infer(config, val_batch, model, device)
-        val_loss += loss
-        if val_count >= config.val_step:
+        loss, components = infer(config, val_batch, model, device)
+        for key in components.keys():
+            log_components["val_" + key] += components[key]
+        log_components["val_batch"] += loss.item()
+        val_loss += loss.item()
+        if val_count >= config.val_count:
             break
-    return val_loss / val_count   # type: ignore
+    for key in log_components.keys():
+        log_components[key] /= val_count
+    return log_components
 
 
 def save_model(config: COMP5421Config, model: COMP5421VAE, step_count: int):
@@ -272,28 +287,30 @@ def main():
         for batch in tqdm(train_loader, desc=f'Epoch {epoch + 1}/{config.num_epochs}'):
             step_count += 1
             optimizer.zero_grad()
-            loss = infer(config, batch, model, device)
+            loss, components = infer(config, batch, model, device)
             loss.backward()
 
             if ((step_count + 1) % config.grad_accumulation_iters == 0):
                 optimizer.step()
                 optimizer.zero_grad()
 
-            if step_count > 0 and step_count % config.val_step == 0:
+            if step_count % config.val_step == 0:
                 with torch.no_grad():
                     try:
-                        val_loss = validate(config, model, val_loader, device)
-                        wandb.log({"val_batch_loss": val_loss.item()}, step=step_count)
+                        val_loss_components = validate(config, model, val_loader, device)
+                        wandb.log(val_loss_components, step=step_count)
                     except Exception as e:
                         tqdm.write(f"Failed to perform validation... {e}")
+                        tqdm.write(traceback.format_exc())
 
-            if step_count > 0 and step_count % config.save_step == 0:
+            if step_count % config.save_step == 0:
                 save_model(config, model, step_count)
 
             epoch_loss += loss.item()
 
             if step_count % config.log_step == 0:
-                wandb.log({"batch_loss": loss.item()}, step=step_count)
+                components["loss"] = loss.item()
+                wandb.log(components, step=step_count)
 
         optimizer.step()
         optimizer.zero_grad()
