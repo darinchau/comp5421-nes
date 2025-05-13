@@ -52,6 +52,9 @@ class COMP5421Config():
     # Logging
     save_step: int
     save_dir: str
+    quantize_audio_on_log: bool         # Whether to quantize the audio to 4-bit during wandb logging or not
+    trim_audio_on_log: bool             # Whether to keep only the maximum velocity note or not
+    log_audio_count: int                # Number of audio samples to log
 
     # Miscellaneous
     seed: int = 5421                    # Random seed for reproducibility
@@ -82,8 +85,13 @@ class COMP5421Config():
         parser.add_argument("--val_count", type=int, default=128, help="Number of validation batches to use")
         parser.add_argument("--log_step", type=int, default=1, help="Logging step frequency")
 
+        parser.add_argument("--log_audio_count", type=int, default=4, help="Number of audio samples to log")
         parser.add_argument("--save_step", type=int, default=4096, help="Model save step frequency")
         parser.add_argument("--save_dir", type=str, default="./checkpoints", help="Directory to save checkpoints")
+        parser.add_argument("--quantize_audio_on_log", action="store_true", help="Whether to quantize the audio to 4-bit during wandb logging or not")
+        parser.add_argument("--no-quantize_audio_on_log", action="store_false", dest="quantize_audio_on_log", help="Whether to quantize the audio to 4-bit during wandb logging or not")
+        parser.add_argument("--trim_audio_on_log", action="store_true", help="Whether to keep only the maximum velocity note or not")
+        parser.add_argument("--no-trim_audio_on_log", action="store_false", dest="trim_audio_on_log", help="Whether to keep only the maximum velocity note or not")
 
         parser.add_argument("--seed", type=int, default=5421, help="Random seed for reproducibility")
 
@@ -214,9 +222,68 @@ def validate(
 
 
 def save_model(config: COMP5421Config, model: COMP5421VAE, step_count: int):
-    save_path = os.path.join(config.save_dir, f"{config.training_name}-{config.dataset_src.split('/')[1]}-step-{step_count}")
+    save_path = os.path.join(config.save_dir, f"{config.training_name}-{config.dataset_src.split('/')[1]}-vae-step-{step_count}")
     torch.save(model.state_dict(), save_path)
     print(f"Model saved to {save_path}")
+
+
+def silence_notes_(batch: torch.Tensor):
+    assert batch.shape == (batch.shape[0], 4, 128, 256), f"Batch shape should be (batch_size, 4, 128, 256) but got {batch.shape}"
+    note_min, note_max = get_note_ranges()
+    for i in range(4):
+        for j in range(128):
+            if not (note_min[i] <= j <= note_max[i]):
+                batch[:, i, j] = 0
+
+
+def enforce_constraints(batch: torch.Tensor, keep_max_note_only: bool = True, quantize: bool = True, check: bool = True) -> torch.Tensor:
+    """Enforce the constraints of the dataset on the batch."""
+    batch_size = batch.shape[0]
+    assert batch.shape == (batch_size, 4, 128, 256), f"Batch shape should be (batch_size, 4, 128, 256) but got {batch.shape}"
+
+    # Deep copy the batch and remove the gradients
+    x = batch.detach()
+
+    # Silence all the notes that are not supposed to sound
+    silence_notes_(x)
+
+    # Take only the note with the highest velocity for each time frame
+    if keep_max_note_only:
+        max_indices = torch.argmax(x, dim=2)
+        y = torch.zeros_like(x)
+        y.scatter_(2, max_indices.unsqueeze(2), x.gather(2, max_indices.unsqueeze(2)))
+        x = y
+        del y
+
+    # Snap all the notes to the nearest 4-bit quantization level
+    x = torch.clamp(x, 0, 1)
+    if quantize:
+        x = torch.round(x * 15) / 15
+
+    # Add the gradients of the original batch to the new batch
+    # nasty little trick I learned from pytorch codebase
+    x = batch + (x - batch).detach()
+    x.requires_grad = batch.requires_grad
+
+    should_check = keep_max_note_only and quantize and check
+    if should_check:
+        check_batch(x)
+    return x
+
+
+def log_audio(batch: torch.Tensor, step_count: int, config: COMP5421Config):
+    latents = enforce_constraints(batch, keep_max_note_only=config.trim_audio_on_log, quantize=config.quantize_audio_on_log, check=True)
+    audios = batch_convert(latents, tickrate=24, sr=44100)
+    audios = audios / np.max(np.abs(audios), axis=1, keepdims=True)
+    latent_images = latents[:, :3] + latents[:, 3:4]  # broadcast the drum channel to the other channels to make it white
+    log = {
+        f"audio_{i}": wandb.Audio(audios[i], sample_rate=44100, caption=f"Generated audio {i}")
+        for i in range(config.log_audio_count)
+    } | {
+        f"image_{i}": wandb.Image(latent_images[i].permute(1, 2, 0).cpu().numpy(), caption=f"Generated image {i}")
+        for i in range(config.log_audio_count)
+    }
+    wandb.log(log, step=step_count)
 
 
 def main():
@@ -270,6 +337,7 @@ def main():
     for epoch in range(config.num_epochs):
         model.train()
         epoch_loss = 0.0
+        log_batch = None
         for batch in tqdm(train_loader, desc=f'Epoch {epoch + 1}/{config.num_epochs}'):
             step_count += 1
             optimizer.zero_grad()
@@ -298,12 +366,16 @@ def main():
                 components["loss"] = loss.item()
                 wandb.log(components, step=step_count)
 
+            log_batch = batch
+
         optimizer.step()
         optimizer.zero_grad()
 
         average_epoch_loss = epoch_loss / len(train_loader)
         print(f'Epoch {epoch + 1} completed, Average Loss: {average_epoch_loss}')
         save_model(config, model, step_count)
+        if log_batch is not None:
+            log_audio(log_batch, step_count, config)  # bad programming practice, but it works
         wandb.log({"epoch_loss": average_epoch_loss}, step=step_count)
 
     save_model(config, model, step_count)
