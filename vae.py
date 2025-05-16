@@ -189,18 +189,21 @@ def infer(config: COMP5421Config, batch: torch.Tensor, model: COMP5421VAE, devic
     batch = batch.to(device)
     batch[batch > eps] = 1
     batch[batch <= eps] = 0
+    sparsity = (batch.sum() / torch.numel(batch)).detach()
 
     batch = batch.detach()
     y, kl = model(batch)
 
     bce0 = F.binary_cross_entropy(y[batch <= eps], torch.zeros_like(y[batch <= eps]))
     bce1 = F.binary_cross_entropy(y[batch > eps], torch.ones_like(y[batch > eps]))
-    bce = bce0 + bce1
+    # sparsity = torch.tensor(0.5)  # Overriding the sparsity to 0.5 for now
+    bce = bce0 * sparsity + bce1 * (1 - sparsity)
 
     loss = config.kl_regularization * kl + bce
     components = {
         "kl": kl.item(),
         "bce": bce.item(),
+        "sparsity": sparsity.item(),
     }
     return loss, components, y
 
