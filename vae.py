@@ -78,7 +78,7 @@ class COMP5421Config():
         parser.add_argument("--sparsity_threshold", type=float, default=1/15, help="Sparsity threshold for the model")
         parser.add_argument("--max_notes_per_time_frame", type=int, default=4, help="Maximum number of notes per time frame")
         parser.add_argument("--kl_regularization", type=float, default=0.5, help="KL regularization weight")
-        parser.add_argument("--sparsity_lambda", type=float, default=0.5, help="Sparsity penalty weight")
+        parser.add_argument("--sparsity_lambda", type=float, default=10, help="Sparsity penalty weight")
 
         parser.add_argument("--val_size", type=float, default=0.1, help="Validation set size as a fraction of the dataset")
         parser.add_argument("--val_step", type=int, default=128, help="Validation step frequency")
@@ -185,17 +185,26 @@ class COMP5421VAE(torch.nn.Module):
 
 
 def infer(config: COMP5421Config, batch: torch.Tensor, model: COMP5421VAE, device: torch.device):
+    eps = 1e-6
     batch = batch.to(device)
+    batch[batch > eps] = 1
+    batch[batch <= eps] = 0
+
+    batch = batch.detach()
     y, kl = model(batch)
 
     l2 = F.mse_loss(batch, y)
 
-    loss = l2 + config.kl_regularization * kl
+    # Want to punish the non-reconstructed notes harder than the non-reconstructed sparsity
+    bce = F.binary_cross_entropy(y[y > eps], torch.ones_like(y[y > eps]), reduction='mean')
+
+    loss = l2 + config.kl_regularization * kl + config.sparsity_lambda * bce
     components = {
         "l2": l2.item(),
         "kl": kl.item(),
+        "bce": bce.item(),
     }
-    return loss, components
+    return loss, components, y
 
 
 def validate(
@@ -209,7 +218,7 @@ def validate(
     log_components = defaultdict(float)
     for val_batch in tqdm(loader, desc="Validating...", total=config.val_count):
         val_count += 1
-        loss, components = infer(config, val_batch, model, device)
+        loss, components, _ = infer(config, val_batch, model, device)
         for key in components.keys():
             log_components["val_" + key] += components[key]
         log_components["val_batch"] += loss.item()
@@ -221,8 +230,8 @@ def validate(
     return log_components
 
 
-def save_model(config: COMP5421Config, model: COMP5421VAE, step_count: int):
-    save_path = os.path.join(config.save_dir, f"{config.training_name}-{config.dataset_src.split('/')[1]}-vae-step-{step_count}")
+def save_model(config: COMP5421Config, model: COMP5421VAE, step_count: int, run_name: str):
+    save_path = os.path.join(config.save_dir, f"{config.training_name}-{run_name}-vae-step-{step_count}")
     torch.save(model.state_dict(), save_path)
     print(f"Model saved to {save_path}")
 
@@ -263,7 +272,10 @@ def enforce_constraints(batch: torch.Tensor, keep_max_note_only: bool = True, qu
     # Add the gradients of the original batch to the new batch
     # nasty little trick I learned from pytorch codebase
     x = batch + (x - batch).detach()
-    x.requires_grad = batch.requires_grad
+    try:
+        x.requires_grad = batch.requires_grad
+    except Exception as e:
+        pass
 
     should_check = keep_max_note_only and quantize and check
     if should_check:
@@ -280,10 +292,17 @@ def log_audio(batch: torch.Tensor, step_count: int, config: COMP5421Config):
         f"audio_{i}": wandb.Audio(audios[i], sample_rate=44100, caption=f"Generated audio {i}")
         for i in range(config.log_audio_count)
     } | {
-        f"image_{i}": wandb.Image(latent_images[i].permute(1, 2, 0).cpu().numpy(), caption=f"Generated image {i}")
+        f"image_{i}": wandb.Image(latent_images[i].permute(1, 2, 0).detach().cpu().numpy(), caption=f"Generated image {i}")
         for i in range(config.log_audio_count)
     }
     wandb.log(log, step=step_count)
+
+
+def get_run_name():
+    run = wandb.run
+    if run is None:
+        return "local"
+    return run.name if run.name is not None else "local"
 
 
 def main():
@@ -341,7 +360,7 @@ def main():
         for batch in tqdm(train_loader, desc=f'Epoch {epoch + 1}/{config.num_epochs}'):
             step_count += 1
             optimizer.zero_grad()
-            loss, components = infer(config, batch, model, device)
+            loss, components, y = infer(config, batch, model, device)
             loss.backward()
 
             if ((step_count + 1) % config.grad_accumulation_iters == 0):
@@ -358,7 +377,7 @@ def main():
                         tqdm.write(traceback.format_exc())
 
             if step_count % config.save_step == 0:
-                save_model(config, model, step_count)
+                save_model(config, model, step_count, get_run_name())
 
             epoch_loss += loss.item()
 
@@ -366,19 +385,19 @@ def main():
                 components["loss"] = loss.item()
                 wandb.log(components, step=step_count)
 
-            log_batch = batch
+            log_batch = y
 
         optimizer.step()
         optimizer.zero_grad()
 
         average_epoch_loss = epoch_loss / len(train_loader)
         print(f'Epoch {epoch + 1} completed, Average Loss: {average_epoch_loss}')
-        save_model(config, model, step_count)
+        save_model(config, model, step_count, get_run_name())
         if log_batch is not None:
             log_audio(log_batch, step_count, config)  # bad programming practice, but it works
         wandb.log({"epoch_loss": average_epoch_loss}, step=step_count)
 
-    save_model(config, model, step_count)
+    save_model(config, model, step_count, get_run_name())
     wandb.finish()
     print("Training completed.")
 
