@@ -193,14 +193,12 @@ def infer(config: COMP5421Config, batch: torch.Tensor, model: COMP5421VAE, devic
     batch = batch.detach()
     y, kl = model(batch)
 
-    l2 = F.mse_loss(batch, y)
+    bce0 = F.binary_cross_entropy(y[batch <= eps], torch.zeros_like(y[batch <= eps]))
+    bce1 = F.binary_cross_entropy(y[batch > eps], torch.ones_like(y[batch > eps]))
+    bce = bce0 + bce1
 
-    # Want to punish the non-reconstructed notes harder than the non-reconstructed sparsity
-    bce = F.binary_cross_entropy(y[y > eps], torch.ones_like(y[y > eps]), reduction='mean')
-
-    loss = l2 + config.kl_regularization * kl + config.sparsity_lambda * bce
+    loss = config.kl_regularization * kl + bce
     components = {
-        "l2": l2.item(),
         "kl": kl.item(),
         "bce": bce.item(),
     }
