@@ -262,11 +262,14 @@ def log_audio(model: COMP5421VAE, batch: torch.Tensor, step_count: int, config: 
     with torch.no_grad():
         z = model.encode(batch)
         z = z.detach()
-        batch = model.decode(z).detach()
-    latents = enforce_constraints(batch, keep_max_note_only=config.trim_audio_on_log, quantize=config.quantize_audio_on_log, check=True)
+        y = model.decode(z).detach()
+    latents = enforce_constraints(y, keep_max_note_only=config.trim_audio_on_log, quantize=config.quantize_audio_on_log, check=True)
     audios = batch_convert(latents, tickrate=24, sr=44100)
     audios = audios / np.max(np.abs(audios), axis=1, keepdims=True)
+    gt_audios = batch_convert(batch, tickrate=24, sr=44100)
+    gt_audios = gt_audios / np.max(np.abs(gt_audios), axis=1, keepdims=True)
     latent_images = latents[:, :3] + latents[:, 3:4]  # broadcast the drum channel to the other channels to make it white
+    gt_images = batch[:, :3] + batch[:, 3:4]
     log = {
         f"audio_{i}": wandb.Audio(audios[i], sample_rate=44100, caption=f"Generated audio {i}")
         for i in range(config.log_audio_count)
@@ -275,6 +278,12 @@ def log_audio(model: COMP5421VAE, batch: torch.Tensor, step_count: int, config: 
         for i in range(config.log_audio_count)
     } | {
         f"latent_{i}": wandb.Image(z[i].permute(1, 2, 0).detach().cpu().numpy(), caption=f"Latent image {i}")
+        for i in range(config.log_audio_count)
+    } | {
+        f"gt_audio_{i}": wandb.Audio(gt_audios[i], sample_rate=44100, caption=f"Ground truth audio {i}")
+        for i in range(config.log_audio_count)
+    } | {
+        f"gt_image{i}": wandb.Image(gt_images[i].permute(1, 2, 0).detach().cpu().numpy(), caption=f"Ground truth image {i}")
         for i in range(config.log_audio_count)
     }
     wandb.log(log, step=step_count)
