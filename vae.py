@@ -38,10 +38,6 @@ class COMP5421Config():
     training_name: str
     grad_accumulation_iters: int        # Accumulate gradients over n iterations
     load_model_from: str | None
-    sparsity_threshold: float
-    max_notes_per_time_frame: int
-    kl_regularization: float
-    sparsity_lambda: float
 
     # Validation
     val_size: float                     # Size of holdout dataset
@@ -75,10 +71,6 @@ class COMP5421Config():
         parser.add_argument("--training_name", type=str, default="comp5421-nes-vae", help="Name of the training run")
         parser.add_argument("--grad_accumulation_iters", type=int, default=2, help="Gradient accumulation steps")
         parser.add_argument("--load_model_from", type=str, default=None, help="Checkpoint to load model from")
-        parser.add_argument("--sparsity_threshold", type=float, default=1/15, help="Sparsity threshold for the model")
-        parser.add_argument("--max_notes_per_time_frame", type=int, default=4, help="Maximum number of notes per time frame")
-        parser.add_argument("--kl_regularization", type=float, default=0.5, help="KL regularization weight")
-        parser.add_argument("--sparsity_lambda", type=float, default=10, help="Sparsity penalty weight")
 
         parser.add_argument("--val_size", type=float, default=0.1, help="Validation set size as a fraction of the dataset")
         parser.add_argument("--val_step", type=int, default=128, help="Validation step frequency")
@@ -143,7 +135,7 @@ class COMP5421VAE(torch.nn.Module):
             self.downsample.append(nn.AvgPool2d(kernel_size=config.downsample_factor[i], stride=config.downsample_factor[i]))
             self.downsample.append(nn.BatchNorm2d(dims[i + 1]))
         self.downsample = nn.Sequential(*self.downsample)
-        self.pre_conv = nn.Conv2d(dims[-1], 2, kernel_size=3, stride=1, padding=1)
+        self.pre_conv = nn.Conv2d(dims[-1], 1, kernel_size=3, stride=1, padding=1)
 
         self.post_conv = nn.Conv2d(1, dims[-1], kernel_size=3, stride=1, padding=1)
         self.upconv = nn.ModuleList()
@@ -156,17 +148,10 @@ class COMP5421VAE(torch.nn.Module):
         self.final_conv = nn.Conv2d(dims[0], 4, kernel_size=3, stride=1, padding=1)
         self.final_activation = nn.Sigmoid()
 
-    def encode(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
         x = self.downsample(x)
         x = self.pre_conv(x)
-        mu = x[:, 0:1, :, :]
-        logvar = x[:, 1:2, :, :]
-        return mu, logvar
-
-    def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
+        return x
 
     def decode(self, x: torch.Tensor) -> torch.Tensor:
         x = self.post_conv(x)
@@ -176,37 +161,23 @@ class COMP5421VAE(torch.nn.Module):
         x = self.final_conv(x)
         return self.final_activation(x)
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        mu, logvar = self.encode(x)
-        z = self.reparameterize(mu, logvar)
+    def forward(self, x: torch.Tensor):
+        z = self.encode(x)
         x = self.decode(z)
-        kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-        return x, kl
+        return x
 
 
 def infer(config: COMP5421Config, batch: torch.Tensor, model: COMP5421VAE, device: torch.device):
-    eps = 1e-6
     batch = batch.to(device)
-    # batch[batch > eps] = 1
-    # batch[batch <= eps] = 0
-    # sparsity = (batch.sum() / torch.numel(batch)).detach()
-
     batch = batch.detach()
-    y, kl = model(batch)
-
-    # bce0 = F.binary_cross_entropy(y[batch <= eps], torch.zeros_like(y[batch <= eps]))
-    # bce1 = F.binary_cross_entropy(y[batch > eps], torch.ones_like(y[batch > eps]))
-    # # sparsity = torch.tensor(0.5)  # Overriding the sparsity to 0.5 for now
-    # bce = bce0 * sparsity + bce1 * (1 - sparsity)
-
+    y = model(batch)
     l2 = F.mse_loss(y, batch)
 
-    loss = config.kl_regularization * kl + l2
+    loss = l2
     components = {
-        "kl": kl.item(),
         "l2": l2.item(),
     }
-    return loss, components, y
+    return loss, components
 
 
 def validate(
@@ -220,7 +191,7 @@ def validate(
     log_components = defaultdict(float)
     for val_batch in tqdm(loader, desc="Validating...", total=config.val_count):
         val_count += 1
-        loss, components, _ = infer(config, val_batch, model, device)
+        loss, components = infer(config, val_batch, model, device)
         for key in components.keys():
             log_components["val_" + key] += components[key]
         log_components["val_batch"] += loss.item()
@@ -285,7 +256,13 @@ def enforce_constraints(batch: torch.Tensor, keep_max_note_only: bool = True, qu
     return x
 
 
-def log_audio(batch: torch.Tensor, step_count: int, config: COMP5421Config):
+def log_audio(model: COMP5421VAE, batch: torch.Tensor, step_count: int, config: COMP5421Config):
+    device = next(model.parameters()).device
+    batch = batch.to(device)
+    with torch.no_grad():
+        z = model.encode(batch)
+        z = z.detach()
+        batch = model.decode(z).detach()
     latents = enforce_constraints(batch, keep_max_note_only=config.trim_audio_on_log, quantize=config.quantize_audio_on_log, check=True)
     audios = batch_convert(latents, tickrate=24, sr=44100)
     audios = audios / np.max(np.abs(audios), axis=1, keepdims=True)
@@ -295,6 +272,9 @@ def log_audio(batch: torch.Tensor, step_count: int, config: COMP5421Config):
         for i in range(config.log_audio_count)
     } | {
         f"image_{i}": wandb.Image(latent_images[i].permute(1, 2, 0).detach().cpu().numpy(), caption=f"Generated image {i}")
+        for i in range(config.log_audio_count)
+    } | {
+        f"latent_{i}": wandb.Image(z[i].permute(1, 2, 0).detach().cpu().numpy(), caption=f"Latent image {i}")
         for i in range(config.log_audio_count)
     }
     wandb.log(log, step=step_count)
@@ -354,6 +334,9 @@ def main():
         config=asdict(config)
     )
 
+    # Do a trial logging
+    log_audio(model, next(iter(train_loader)), step_count, config)
+
     # Training Loop
     for epoch in range(config.num_epochs):
         model.train()
@@ -362,7 +345,7 @@ def main():
         for batch in tqdm(train_loader, desc=f'Epoch {epoch + 1}/{config.num_epochs}'):
             step_count += 1
             optimizer.zero_grad()
-            loss, components, y = infer(config, batch, model, device)
+            loss, components = infer(config, batch, model, device)
             loss.backward()
 
             if ((step_count + 1) % config.grad_accumulation_iters == 0):
@@ -387,7 +370,7 @@ def main():
                 components["loss"] = loss.item()
                 wandb.log(components, step=step_count)
 
-            log_batch = y
+            log_batch = batch
 
         optimizer.step()
         optimizer.zero_grad()
@@ -396,7 +379,7 @@ def main():
         print(f'Epoch {epoch + 1} completed, Average Loss: {average_epoch_loss}')
         save_model(config, model, step_count, get_run_name())
         if log_batch is not None:
-            log_audio(log_batch, step_count, config)  # bad programming practice, but it works
+            log_audio(model, log_batch, step_count, config)  # bad programming practice, but it works
         wandb.log({"epoch_loss": average_epoch_loss}, step=step_count)
 
     save_model(config, model, step_count, get_run_name())
