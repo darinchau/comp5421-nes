@@ -90,6 +90,16 @@ class COMP5421Config():
         args = parser.parse_args()
         return cls(**vars(args))
 
+    @property
+    def latent_size(self):
+        x = 128
+        for factor in self.downsample_factor:
+            x = ceil(x / factor)
+        y = 256
+        for factor in self.downsample_factor:
+            y = ceil(y / factor)
+        return (1, x, y)
+
 
 class COMP5421Dataset(torch.utils.data.Dataset):
     def __init__(self, config: COMP5421Config):
